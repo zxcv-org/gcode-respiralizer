@@ -1,0 +1,4 @@
+#!/bin/bash
+set -e
+clear
+cargo run --release -- /c/stuff/gr_test/fine_vase_mode_funnel_0.01mm_PETG_MK3S_23h44m.gcode /c/stuff/gr_test/coarse_vase_mode_funnel_0.3mm_PETG_MK3S_45m.gcode /c/stuff/gr_test/OUTPUT.gcode

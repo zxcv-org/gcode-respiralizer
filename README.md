@@ -4,6 +4,8 @@ The project/repo name is gcode-respiralizer (dash).
 
 The binary name is gcode_respiralizer (underscore).
 
+The lib name is gcode_respiralizer_lib (underscores).
+
 ## Goal / Purpose
 
 Eliminate the vase mode "seam" that results when slicing in vase mode in
@@ -61,10 +63,14 @@ welcome.
    Post-processing steps
 1. Set to vase mode, accept 1 perimeter etc.
 1. Un-check vase mode (but leave 1 perimeter etc).
-1. Set layer height and first layer height to 0.002mm (1/100 of 0.2mm)
+1. Set layer height and first layer height to 0.02mm (~1/10th of the layer
+   height you actually want)
 1. Slice (gcode-respiralizer will auto-detect that this is the finely-sliced
    file, and will save a copy for gcode-respiralizer to use later)
+1. Set retract/detract/extra detract to all off / 0.0mm.
 1. Set layer height to 0.2mm or 0.3mm (or whatever you actually want)
+1. Set retract/detract/extra detract as desired (0.0mm typically wouldn't be a
+   disaster for vase mode, but YMMV).
 1. Check vase mode again.
 1. Slice (gcode-respiralizer will auto-detect that this is the coarse-sliced
    file, and based on filename, will pair it up with the previously-saved
