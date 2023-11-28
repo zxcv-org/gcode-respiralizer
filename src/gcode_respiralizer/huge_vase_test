@@ -1,4 +1,4 @@
 #!/bin/bash
 set -e
 clear
-cargo run --release -- /c/stuff/gr_test/fine_huge_vase_bottom_0.03.gcode /c/stuff/gr_test/fudged_huge_vase_bottom_0.3.gcode /c/stuff/gr_test/OUTPUT_huge_vase.gcode
+cargo run --release -- /c/stuff/gr_test/fine_huge_vase_0.03mm_PETG_MK3S.gcode /c/stuff/gr_test/fudged_huge_vase_0.3mm_PETG_MK3S.gcode /c/stuff/gr_test/OUTPUT_huge_vase.gcode

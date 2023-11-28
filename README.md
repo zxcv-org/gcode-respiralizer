@@ -59,6 +59,9 @@ welcome.
 
 ### Prusaslicer
 
+1. Switch from arachne to classic. Leave it classic for the rest of this (vase
+   mode uses classic without indicating so in the UI; we need the non-vase
+   slicing below to use classic also).
 1. Put path to gcode_respiralizer binary in the Print settings ->
    Post-processing steps
 1. Set to vase mode, accept 1 perimeter etc.
@@ -75,7 +78,9 @@ welcome.
 1. Slice (gcode-respiralizer will auto-detect that this is the coarse-sliced
    file, and based on filename, will pair it up with the previously-saved
    finely-sliced file)
-1. Open output in gcode analyzer, visually verify that it looks plausible.
+1. Open output in gcode analyzer, visually verify that it looks plausible -
+   sweep through the layers; check again - it is up to you to verify that you
+   want to print this weirdly-generated gcode.
 1. Print, and hopefully verify that the vase mode "seam" is not present.
 
 ## Theory of Operation

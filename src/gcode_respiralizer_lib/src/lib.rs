@@ -3,8 +3,8 @@ use rand::Rng;
 use regex::Regex;
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashSet, VecDeque};
-use std::f32::NAN;
 use std::f32::consts::PI;
+use std::fmt::Write as fmt_Write;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::ops;
@@ -50,8 +50,7 @@ pub use u32 as PointIndex;
 // fine slicing perimeters, but not so big that we'll think the intro line is part of the model
 // for example. This threshold limit does not apply for the first found closest point, which we'll
 // use without any "other" point if this threshold is exceeded by any other-z point on the fine
-// slicing perimeters. So it's not a disaster for this threshold to be exceeded (we don't just keep
-// the coarse slicing point).
+// slicing perimeters. So it's not a disaster for this threshold to be exceeded.
 //
 // This needs to be small enough to permit "detaching" from the other z perimeter if the closest
 // point perimeter is just doing it's own thing that's totally different than any nearby perimeter.
@@ -63,24 +62,6 @@ pub use u32 as PointIndex;
 const OTHER_Z_MAX_DISTANCE_DEFAULT : Mm = 2.0 * SQRT_2 * 0.3;
 const REFINEMENT_MAX_ITERATIONS : u32 = 12;
 const REFINEMENT_GOOD_ENOUGH_TO_STOP_UPDATE_DISTANCE : Mm = 0.001;
-
-const FINE_LAYER_HEIGHT : Mm = 0.03;
-const COARSE_LAYER_HEIGHT : Mm = 0.3;
-const NO_TERP_Z_DELTA : Mm = COARSE_LAYER_HEIGHT * 1.5;
-// The coarse point would be in the "right place" in xy if it's z were just different by up to 1
-// coarse layer, given how the slicer's vase mode slicing works.
-const NO_TERP_Q_P_DISTANCE: Mm = COARSE_LAYER_HEIGHT * 1.5;
-// Under the assumption that P1 and P2 are within epsilon of being nearest-points in adjacent fine
-// layers (which they may not be), this is the 90 degree rotated max abs slope for terping. This is
-// ("rise over run") with "rise" being perpendicular to z and "run" being z). A 45 degree angle is
-// a slope of 1. A higher value here is a more-difficult-to-print overhang. This is the slope of
-// the overhang angle, not the slope of the "generate supports" threshold angle in prusaslicer
-// which uses the opposite way to specify the same angle. All that said, this also needs to be
-// fairly permissive since the assumption at the start can be incorrect, since we find P1 and P2 as
-// closest to the coarse point, but not necessarily to each other ("fixing" this would create its
-// own issues). So the factor in front allows for some degree of "eyeballing it" offset along the
-// fine perimeters between P1 and P2.
-const NO_TERP_P2_P1_XY_DISTANCE_PER_Z: Mm = NAN;
 
 // To have 3 segments to catch zig-zag-zig, or to remove a tiny pointless segment between to other
 // segments (while evaluating the reasonable-ness of doing so), we need 4 points.
@@ -143,7 +124,7 @@ fn file_lines(filename: &str) -> io::Result<io::Lines<io::BufReader<std::fs::Fil
     Ok(io::BufReader::with_capacity(64 * 1024, fs::File::open(filename).expect("fs::File::open failed")).lines())
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 struct Point {
     x: Mm,
     y: Mm,
@@ -360,6 +341,7 @@ pub struct G1LineContext<'a> {
     line: &'a str,
     old_loc: Point,
     g: &'a GcodeState,
+    has_explicit_z: bool,
     opt_extrude: Option<Mm>,
     opt_f: Option<Mm>,
     opt_comment: Option<&'a str>,
@@ -399,6 +381,7 @@ pub fn process_lines(gcode_lines: io::Lines<io::BufReader<std::fs::File>>, line_
             };
             let opt_extrude : Option<Mm>;
             let opt_f : Option<Mm>;
+            let has_explicit_z : bool;
             if let Some(x_captures) = g1_sub_x.captures(xyzef) {
                 // println!("got x");
                 g.loc.x = x_captures.name("X").unwrap().as_str().parse().unwrap();
@@ -410,6 +393,9 @@ pub fn process_lines(gcode_lines: io::Lines<io::BufReader<std::fs::File>>, line_
             if let Some(z_captures) = g1_sub_z.captures(xyzef) {
                 // println!("got z");
                 g.loc.z = z_captures.name("Z").unwrap().as_str().parse().unwrap();
+                has_explicit_z = true;
+            } else {
+                has_explicit_z = false;
             }
             if let Some(e_captures) = g1_sub_e.captures(xyzef) {
                 // println!("got e");
@@ -440,7 +426,7 @@ pub fn process_lines(gcode_lines: io::Lines<io::BufReader<std::fs::File>>, line_
                 panic!("G1 when !g.is_rel_e");
             }
 
-            let g1_line_context = G1LineContext{line: &line, old_loc, g: &g, opt_extrude, opt_f, opt_comment};
+            let g1_line_context = G1LineContext{line: &line, old_loc, g: &g, has_explicit_z, opt_extrude, opt_f, opt_comment};
             (line_handler.g1_handler)(g1_line_context);
             continue;
         }
@@ -666,7 +652,6 @@ impl ExtrudingG1Buffer {
     }
 
     fn peephole_buffer(&mut self) {
-return;
         if self.g1s.len() < 4 {
             return;
         }
@@ -753,9 +738,11 @@ return;
         }
         {
             let g = &mut self.g1s;
-            g.get_mut(g.len() - 3).unwrap().lines_after_g1.push("; deleted segment here".into());
-            g.get_mut(g.len() - 3).unwrap().g1.point = middle_point;
-            g.remove(g.len() - 2);
+            let mut removed = g.remove(g.len() - 2).unwrap();
+            let fixup = g.get_mut(g.len() - 2).unwrap();
+            fixup.lines_after_g1.push("; deleted segment here".into());
+            fixup.g1.point = middle_point;
+            fixup.lines_after_g1.append(&mut removed.lines_after_g1);
         }
         // Fix up extrude for first and last.
         {
@@ -778,7 +765,23 @@ fn generate_output(fine_layers : Layers, coarse_gcode_lines: io::Lines<io::BufRe
     let mut old_loc = Point::default();
     let mut g1_handler = |c: G1LineContext| {
         let mut output_buffer = output_buffer.borrow_mut();
-        if !c.opt_extrude.is_some() {
+        if c.g.loc == c.old_loc && !c.opt_extrude.is_some() {
+            let mut new_line = String::new();
+            match c.opt_f {
+                None => {
+                    write!(&mut new_line, "; same pos, no E, no F, removed: {}", c.line).expect("write failed");
+                },
+                Some(f) => {
+                    write!(&mut new_line, "G1 F{} ; was same pos, no E, squelched: {}", f, c.line).expect("write failed");
+                    if let Some(comment) = c.opt_comment {
+                        write!(new_line, " {}", comment).expect("write failed");
+                    }
+                }
+            }
+            output_buffer.queue_line(&new_line);
+            return;
+        }
+        if !c.opt_extrude.is_some() || !c.has_explicit_z {
             output_buffer.queue_line(c.line);
             // We don't worry about this point being non-corrected. Technically "wrong" but doesn't
             // matter enough to worry about.
@@ -1019,264 +1022,8 @@ mod tests {
 
     #[test]
     fn it_works() {
-        //let result = add(2, 2);
+        panic!("no tests yet");
+        //let result = 2 + 2;
         //assert_eq!(result, 4);
     }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-fn generate_output_old(fine_layers : Layers, coarse_gcode_lines: io::Lines<io::BufReader<std::fs::File>>, buf_writer: io::BufWriter<std::fs::File>) {
-    let output_buffer = Rc::new(RefCell::new(ExtrudingG1Buffer::new(buf_writer)));
-    let mut max_iterations_exceeded_count: u64 = 0;
-    let mut good_enough_before_max_iterations_count: u64 = 0;
-    let mut old_loc = Point::default();
-    let mut g1_handler = |c: G1LineContext| {
-        let mut output_buffer = output_buffer.borrow_mut();
-        if !c.opt_extrude.is_some() {
-            output_buffer.queue_line(c.line);
-            // We don't worry about this point being non-corrected. Technically "wrong" but doesn't
-            // matter enough to worry about.
-            old_loc = c.g.loc;
-            return;
-        }
-        //println!("<<<< {}", c.line);
-        let mut point_so_far : Point = c.g.loc;
-        let mut refinement_step_ordinal = 0;
-        loop {
-            let kd_query_point = &[point_so_far.x, point_so_far.y, point_so_far.z];
-            // TODO: Consider biasing the distance metric toward same-z candidates, to encourage fixing xy in fewer iterations.
-            let nearest_kd_neighbour = fine_layers.kd_tree.nearest_one::<kiddo::float::distance::SquaredEuclidean>(kd_query_point);
-            let segment_start_point_index = nearest_kd_neighbour.item;
-
-            let mut best_distance_so_far = point_segment_index_distance(&fine_layers, point_so_far, segment_start_point_index);
-            let mut checked_segments : HashSet<PointIndex> = HashSet::new();
-            checked_segments.insert(segment_start_point_index);
-            let mut best_segment_so_far = segment_start_point_index;
-
-            // To be sure that we've found the closest point on any segment, we have to expand the
-            // search radius for kd_tree points to be large enough to account for both
-            // MAX_SUBSEGMENT_LENGTH (in case the kd_tree point is MAX_SUBSEGMENT_LENGTH further away
-            // worst-case) and KD_TREE_FUDGE_RADIUS (in case the kd_tree point got fudged away by the
-            // max due to being diagonally point to furthest point across the fudge cube).
-
-            let max_possible_distance_of_kd_tree_point_of_best_segment: Mm = best_distance_so_far + MAX_SUBSEGMENT_LENGTH + KD_TREE_FUDGE_RADIUS;
-            let squared_euclidean_distance = max_possible_distance_of_kd_tree_point_of_best_segment * max_possible_distance_of_kd_tree_point_of_best_segment;
-            // We'd use within_unsorted_iter(), except that seems to have a stack overflow (only
-            // sometimes), so instead we use within_unsorted().
-            //
-            // TODO: post issue, preferably with repro I guess, like by setting constant rng seed.
-            let neighbours = fine_layers.kd_tree.within_unsorted::<SquaredEuclidean>(kd_query_point, squared_euclidean_distance);
-            let neighbours = neighbours.iter().map(|neighbour| {neighbour.item});
-
-            // Can uncomment this if kd_tree seems possibly sus.
-            //let mut neighbours : Vec<u32> = vec!();
-            //for segment_run in &fine_layers.segment_runs {
-            //    for segment_index in segment_run.start..segment_run.end {
-            //        neighbours.push(segment_index);
-            //    }
-            //}
-
-            for neighbour in neighbours {
-                let candidate_segment_start_index = neighbour;
-
-                // multiple sub-segments of the same segment can be returned
-                if checked_segments.contains(&candidate_segment_start_index) {
-                    // we already checked the actual segment, so we don't need to re-check it having
-                    // found it again via a different sub-segment's kd_tree point
-                    continue;
-                }
-                checked_segments.insert(candidate_segment_start_index);
-    
-                let candidate_distance = point_segment_index_distance(&fine_layers, point_so_far, candidate_segment_start_index);
-                if candidate_distance > best_distance_so_far {
-                    continue;
-                }
-
-                best_distance_so_far = candidate_distance;
-                best_segment_so_far = candidate_segment_start_index;
-            }
-    
-            let best_segment_1 = best_segment_so_far;
-    
-            // Now we want a best_segment_2, that is not in the same layer as best_segment_1. This
-            // means we want to expand the search again, and filter out the z value of
-            // best_segment_1. Unfortunately, the kd_tree doesn't let us keep expanding the sphere
-            // and get points in increasing distance, nor does it let us query for the nearest
-            // point passing a filter. Because we'll be connecting the closest point on
-            // best_segment_1 with the closest point on best_segment_2 to construct a segment
-            // ("construction segment"; not printed), and then using the point on that line that's
-            // closest to the z value of loc, we only really care about the actual geometry of
-            // best_segment_2 when the z value of best_segment_2 is in the opposite z direction
-            // from best_segment_1, since if it's in the same z direction, we'll just end up
-            // clamping to the best_segment_1 end of the constructed segment anyway (we don't
-            // extrapolate beyond the ends of the construction segment since that could cause the
-            // output gcode to move backwards for short distances over already-printed perimeter
-            // when crossing a seam in the layer below.
-            //
-            // By limiting the search for best_segment_2 to a reasonable distance, and just using
-            // best_segment_1 if we don't find a best_segment_2, we also make sure the intro line
-            // is just the intro line, and not some sort of mess. It also might handle particularly
-            // advanced designed-for-vase-mode isolated bridge-through-the-air-intentionally paths
-            // better, though that's TBV.
-            //
-            // The case we really want to do well is when the z value of loc is between two fine
-            // layers' z values, with the two fine layers each having a nearby point that's roughly
-            // a fractional coarse layer height away from loc in z. At the "fudge line", the xy
-            // distance can be larger, but that's what all this code is designed to fix after all.
-            //
-            // The threshold distance is a max distance from loc (not expanded by distance to
-            // best_segment_1), but to find candidates we still need to expand beyond that
-            // threshold distance similar to what we did for best_segment_1 above.
-
-            let exclude_z = fine_layers.points[best_segment_so_far as usize].z;
-
-            // Expanding the kd_tree distance threshold below doesn't imply that we won't enforce
-            // the OTHER_Z_MAX_DISTANCE_DEFAULT when it comes to the actual distances found.
-            let mut best_distance_so_far = OTHER_Z_MAX_DISTANCE_DEFAULT;
-            // The best segment can remain None if we don't find anything that passes the filter
-            // any closer than OTHER_Z_MAX_DISTANCE_DEFAULT.
-            let mut best_segment_so_far : Option<PointIndex> = None;
-            checked_segments.clear();
-
-            let max_possible_distance_of_kd_tree_point_of_best_segment = OTHER_Z_MAX_DISTANCE_DEFAULT + MAX_SUBSEGMENT_LENGTH + KD_TREE_FUDGE_RADIUS;
-            let squared_euclidean_distance = max_possible_distance_of_kd_tree_point_of_best_segment * max_possible_distance_of_kd_tree_point_of_best_segment;
-
-            let neighbours = fine_layers.kd_tree.within_unsorted::<SquaredEuclidean>(kd_query_point, squared_euclidean_distance);
-            let neighbours = neighbours.iter().map(|neighbour| {neighbour.item});
-
-            // Can uncomment this if kd_tree seems possibly sus.
-            //let mut neighbours : Vec<u32> = vec!();
-            //for segment_run in &fine_layers.segment_runs {
-            //    for segment_index in segment_run.start..segment_run.end {
-            //        neighbours.push(segment_index);
-            //    }
-            //}
-
-            for neighbour in neighbours {
-                let candidate_segment_start_index = neighbour;
-
-                if checked_segments.contains(&candidate_segment_start_index) {
-                    continue;
-                }
-                checked_segments.insert(candidate_segment_start_index);
-
-                let candidate_segment_z = fine_layers.points[candidate_segment_start_index as usize].z;
-                // The z values are all parsed from the same ascii or copied, so == should work for
-                // this since they should be bit-for-bit the same (or not the same z).
-                if candidate_segment_z == exclude_z {
-                    continue;
-                }
-
-                let candidate_distance = point_segment_index_distance(&fine_layers, point_so_far, candidate_segment_start_index);
-                if candidate_distance > best_distance_so_far {
-                    continue;
-                }
-
-                best_distance_so_far = candidate_distance;
-                best_segment_so_far = Some(candidate_segment_start_index);
-            }
-            let best_segment_2 = best_segment_so_far;
-
-            let best_point_1 = clamp_point_to_segment_index(&fine_layers, point_so_far, best_segment_1);
-            let best_point_2 = best_segment_2.map(|segment_start_index| {
-                clamp_point_to_segment_index(&fine_layers, point_so_far, segment_start_index)
-            });
-
-            let old_point_so_far = point_so_far;
-
-            let loc_z = c.g.loc.z;
-            if best_point_2.is_none() {
-                point_so_far = Point{x: best_point_1.x, y: best_point_1.y, z: loc_z};
-            } else {
-                let best_segment_2 = best_segment_2.unwrap();
-                let best_point_2 = best_point_2.unwrap();
-                if best_point_1.z == best_point_2.z {
-                    dbg!(best_segment_1);
-                    dbg!(best_segment_2);
-                    dbg!(best_point_1);
-                    dbg!(best_point_2);
-                    dbg!(fine_layers.points[best_segment_1 as usize]);
-                    dbg!(fine_layers.points[best_segment_1 as usize + 1]);
-                    dbg!(fine_layers.points[best_segment_2 as usize]);
-                    dbg!(fine_layers.points[best_segment_2 as usize + 1]);
-                }
-                assert!(best_point_1.z != best_point_2.z, "{} {}", best_point_1.z, best_point_2.z);
-                let low_z_point : Point;
-                let high_z_point : Point;
-                if best_point_1.z > best_point_2.z {
-                    low_z_point = best_point_2;
-                    high_z_point = best_point_1;
-                } else {
-                    low_z_point = best_point_1;
-                    high_z_point = best_point_2;
-                }
-                if point_so_far.z >= high_z_point.z {
-                    point_so_far = Point{x: high_z_point.x, y: high_z_point.y, z: loc_z};
-                } else if point_so_far.z <= low_z_point.z {
-                    point_so_far = Point{x: low_z_point.x, y: low_z_point.y, z: loc_z};
-                } else {
-                    // barycentric-ish
-                    let high_z_factor = (loc_z - low_z_point.z) / (high_z_point.z - low_z_point.z);
-                    let high_minus_low = high_z_point - low_z_point;                    
-                    let tmp_point = low_z_point + high_minus_low * high_z_factor;
-                    // should be very close to equal
-                    assert!((tmp_point.z - loc_z).abs() < 0.01);
-                    point_so_far = Point{x: tmp_point.x, y: tmp_point.y, z: loc_z};
-                }
-            }
-
-            refinement_step_ordinal += 1;
-            if refinement_step_ordinal >= REFINEMENT_MAX_ITERATIONS {
-                max_iterations_exceeded_count += 1;
-                break;
-            }
-
-            let update_vec = point_so_far - old_point_so_far;
-            if update_vec.norm() < REFINEMENT_GOOD_ENOUGH_TO_STOP_UPDATE_DISTANCE {
-                good_enough_before_max_iterations_count += 1;
-                break;
-            }
-        }
-        let new_point = point_so_far;
-
-        let old_move_distance = (c.g.loc - c.old_loc).norm();
-        let old_extrude = c.opt_extrude.unwrap();
-        let new_move_distance = (new_point - old_loc).norm();
-        let new_extrude = old_extrude * new_move_distance / old_move_distance;
-
-        //dbg!(old_move_distance);
-        //dbg!(old_extrude);
-        //dbg!(new_move_distance);
-        //dbg!(new_extrude);
-
-        output_buffer.queue_g1(ExtrudingG1 { point: new_point, extrude: new_extrude, opt_f: c.opt_f, opt_comment: c.opt_comment.map(|s| {s.into()}) });
-
-        old_loc = new_point;
-    };
-
-    let mut default_handler = |s: &str| {
-        output_buffer.borrow_mut().queue_line(s);
-    };
-
-    let mut line_handler = GcodeLineHandler{g1_handler: &mut g1_handler, default_handler: &mut default_handler};
-
-    process_lines(coarse_gcode_lines, &mut line_handler);
-
-    output_buffer.borrow_mut().flush();
-
-    println!("max_iterations_exceeded_count: {} good_enough_before_max_iterations_count: {}", max_iterations_exceeded_count, good_enough_before_max_iterations_count);
 }
