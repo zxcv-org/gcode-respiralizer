@@ -35,6 +35,49 @@ use std::time::Instant;
 //   how to fix?
 //     * check for zig/zag/zig direction reversals, emit as extra gcode comments (this will determine if the pausing is caused by reversals, or just a short segment, maybe at slightly different angle, or degenerately-calculated angle)
 
+// memory use ideas
+//   * could split up big kd_tree into kd_tree per fine layer, and only expand search to further z kd_tree(s) if closest point found so far is further than z distance of additional layer
+//   * could spool kd_tree per fine layer(s) through memory, not keeping all at once
+
+// Ideas for dealing with fudge seam where it creates pointless bridging (in contrast to point-ful bridging that's on purpose).
+//   * Assumption:
+//     * Each horizontally-sliced fine layer is authoritative in the sense that horizontally-sliced layers never do pointless bridging; all bridging in horizontally-sliced layers is pointful.
+//   * Prerequisites:
+//     * be able to iterate along fine perimeters, including the jump back around to 1st point of that perimeter when needed
+//     * track prev output point's p1 and opt p2, keeping the fine perimeter segment index and the 0.0-norm along that segment
+//   * How to detect questionable bridging:
+//     * prev output point uses set of fine z values that's entirely non-overlapping with set of fine z values used by new point (not yet an output point).
+//     * along prev-new line, do binary-search-esque thing that tries to find (actually bracket) a small range along line that goes from old z closest to new z closest; the distance between found z points for each end of that range is > a jump thresh
+//   * Try to find a better path.
+//     * select closest fine point to prev output point, select that fine perimeter (this isn't the exact splice start yet, but it is the fine splice perimeter)
+//     * LOOKAHEAD_DISTANCE - collect/iterate coarse segments up to and including this distance
+//     * need to exclude looping all the way around, so ... threshold the z difference to < 1/2 layer height as well
+//     * (potentially make/use kd_tree with just the one fine perimeter)
+//     * lookahead along coarse slicing (along segments, not just the points), find the "best" pair of points on coarse and find slicing that are close enough (in xy distance) to each other
+//       * while searching, can tighten down the search radius as we find decent points along the way, and can have an initial search radius based on close-enough threshold
+//       * if we find a pair of points below quite-good thresh, we can stop before LOOKAHEAD_DISTANCE
+//       * end_provisional
+//     * prev output point stays in output; this corresponds to the prev input point before the splice, this is beginning of splice z terp
+//     * find closest point on selected z fine perimeter to the prev output point, including segment index and 0-norm value
+//     * in loop, iterate forward on selected fine perimeter by small amounts (1/2 res could work, starting at 0) and "fix" the point using the usual p1 p2 method,
+//       until a fixed point is found which is >= along any fine z perimeters in common with prev output point (up to both of them), or has no perimeters in common
+//       in which case that's also "fine" in the "everything is fine" sense - just take that point and hope in that case
+//       * fallback: if we get further along than end_provisional, don't splice after all
+//     * now we have/know the first spliced-in input point (the first one that passes the check above)
+//     * splice middle fine points, but with z terped over distance
+//     * to make the end of the splice
+//       * take the end_provisional fine point, with z from end_provisional coarse (end of z terp)
+//       * "fix" the end_provisional fine point (with normal alg), to get up to two positions along 2 fine perimeters
+//       * starting from end_provisional coarse point, step forward by small amounts along coarse segment(s), and "fix" the point, until fixed point is >= along any fine z perimeters in common with fixed end_provisional fine,
+//         or has no perimeters in common, or is too far in which case panic
+//   * splicing considerations
+//     * non-G1 lines
+//     * G1 lines that only change F
+//     * accumulate these and just plop them all before the splice segments, mainly to keep layer change comments etc
+//     * may cause some to happen slightly early but that's fine (for things like printing slower for smaller layers, changing fan at layer, etc)
+//   * done splicing in a "better" path; process the new input points as normal
+
+
 // This way we can switch to f64 easily for comparing memory and performance.
 // Also possibly in future it could make sense to "newtype" these, if it seems
 // like it'd help avoid mistakes.

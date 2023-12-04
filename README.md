@@ -59,6 +59,8 @@ welcome.
 
 ### Prusaslicer
 
+1. Turn off detect bridging perimeters (to slice faster and avoid bridging flow
+   ratio in any part of the spiral).
 1. Switch from arachne to classic. Leave it classic for the rest of this (vase
    mode uses classic without indicating so in the UI; we need the non-vase
    slicing below to use classic also).
