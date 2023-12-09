@@ -1,6 +1,6 @@
+use gcode_respiralizer_lib as gr;
 use std::env;
 use std::thread;
-use gcode_respiralizer_lib as gr;
 
 const STACK_SIZE: usize = 16 * 1024 * 1024;
 
@@ -10,14 +10,18 @@ fn run() {
 
     #[derive(Debug)]
     struct Filenames<'a> {
-        fine_reference : &'a str,
-        coarse_reference : &'a str,
+        fine_reference: &'a str,
+        coarse_reference: &'a str,
         // output and coarse_reference can be the same filename; we don't overwrite until we're sure we have complete output
-        output : &'a str,
+        output: &'a str,
     }
 
     let filenames = if args.len() == 4 {
-        Filenames{fine_reference: &args[1], coarse_reference: &args[2], output: &args[3]}
+        Filenames {
+            fine_reference: &args[1],
+            coarse_reference: &args[2],
+            output: &args[3],
+        }
     } else if args.len() == 2 {
         // TODO: if detect fine, save aside; if detect coarse, use saved-aside fine + coarse + output over coarse when sure we have complete output
         eprintln!("in-place / autodetect not yet supported");
@@ -29,7 +33,11 @@ fn run() {
 
     dbg!(&filenames);
 
-    gr::process_files(filenames.fine_reference, filenames.coarse_reference, filenames.output);
+    gr::process_files(
+        filenames.fine_reference,
+        filenames.coarse_reference,
+        filenames.output,
+    );
 }
 
 fn main() {
@@ -42,6 +50,11 @@ fn main() {
     // we're about to create here.
     println!("delegating to separate 'primary' thread with larger stack for KdTree (might still overflow?");
     // Switch threads before we have any data, to avoid needing to worry about Send or Sync.
-    let primary = thread::Builder::new().stack_size(STACK_SIZE).spawn(run).expect("thread spawn failed");
-    primary.join().expect("primary thread join (from main) failed");
+    let primary = thread::Builder::new()
+        .stack_size(STACK_SIZE)
+        .spawn(run)
+        .expect("thread spawn failed");
+    primary
+        .join()
+        .expect("primary thread join (from main) failed");
 }
