@@ -59,28 +59,28 @@ use std::time::Instant;
 //     * need to exclude looping all the way around, so ... threshold the z difference to < 1/2 layer height as well
 //     * (potentially make/use kd_tree with just the one fine perimeter)
 //     * lookahead along coarse slicing (along segments, not just the points), find the "best" pair of points on coarse and find slicing that are close enough (in xy distance) to each other
-//       * while searching, can tighten down the search radius as we find decent points along the way, and can have an initial search radius based on close-enough threshold
+//       * while searching, can tighten down the search radius as we find best decent point along the way so far, and can have an initial search radius based on close-enough threshold
 //       * if we find a pair of points below quite-good thresh, we can stop before LOOKAHEAD_DISTANCE
-//       * end_provisional
+//       * end_provisional = best points on both fine and coarse (closest to each other)
 //     * prev output point stays in output; this corresponds to the prev input point before the splice, this is beginning of splice z terp
 //     * find closest point on selected z fine perimeter to the prev output point, including segment index and 0-norm value
 //     * in loop, iterate forward on selected fine perimeter by small amounts (1/2 res could work, starting at 0) and "fix" the point using the usual p1 p2 method,
 //       until a fixed point is found which is >= along any fine z perimeters in common with prev output point (up to both of them), or has no perimeters in common
 //       in which case that's also "fine" in the "everything is fine" sense - just take that point and hope in that case
-//       * fallback: if we get further along than end_provisional, don't splice after all
+//       * fallback: if we get further along than end_provisional (or maybe than min(end_provisional, BEGIN_SPLICE_FAIL_DISTANCE)), don't splice after all
 //     * now we have/know the first spliced-in input point (the first one that passes the check above)
-//     * splice middle fine points, but with z terped over distance
-//     * to make the end of the splice
+//     * splice middle fine points, but with z delta from coarse terped over fine distance
+//     * to select/make the end of the splice
 //       * take the end_provisional fine point, with z from end_provisional coarse (end of z terp)
 //       * "fix" the end_provisional fine point (with normal alg), to get up to two positions along 2 fine perimeters
 //       * starting from end_provisional coarse point, step forward by small amounts along coarse segment(s), and "fix" the point, until fixed point is >= along any fine z perimeters in common with fixed end_provisional fine,
-//         or has no perimeters in common, or is too far in which case panic
+//         or has no perimeters in common, or is farther than END_SPLICE_FAIL_DISTANCE in which case panic
 //   * splicing considerations
 //     * non-G1 lines
 //     * G1 lines that only change F
 //     * accumulate these and just plop them all before the splice segments, mainly to keep layer change comments etc
 //     * may cause some to happen slightly early but that's fine (for things like printing slower for smaller layers, changing fan at layer, etc)
-//   * done splicing in a "better" path; process the new input points as normal
+//   * done splicing in a "better" path into the input points; process the new input points as normal
 
 // This way we can switch to f64 easily for comparing memory and performance.
 // Also possibly in future it could make sense to "newtype" these, if it seems
@@ -383,30 +383,118 @@ impl ops::Neg for Vec3 {
     }
 }
 
-//struct ClosestPointsBetweenSegmentsResult {
-//    // The minmum distance between a and b. This takes into account the fact that a and b are
-//    // segments, not lines.
-//    min_distance: Mm,
-//    // How far away from a_start along a is closest to any point of b.
-//    along_a_distance: Mm,
-//    // How far away from b_start along b is closest to any point of a.
-//    along_b_distance: Mm,
-//}
-//
-//fn closest_points_between_segments(a_start: &Point, a_end: &Point, b_start: &Point, b_end: &Point) -> ClosestPointsBetweenSegmentsResult {
-//    panic!("impl");
-//
-//    let a_vec = *a_end - *a_start;
-//    let b_vec = *b_end - *b_start;
-//    let a_norm = a_vec.norm();
-//    let b_norm = b_vec.norm();
-//    // A non-unit vector normal to the two planes which are parallel to each other. One plane
-//    // contains both points of a and the other plane contains both points of b.
-//    let normal_direction = a_vec.cross(b_vec);
-//    // A vector from a point of a to point of b.
-//    let arb_b_minus_arb_a = *b_end - *a_end;
-//    ClosestPointsBetweenSegmentsResult { min_distance: 0.0, along_a_distance: 0.0, along_b_distance: 0.0 }
-//}
+#[allow(dead_code)]
+struct ClosestPointsBetweenSegmentsResult {
+    // The minmum distance between a and b. This takes into account the fact that a and b are
+    // segments, not lines.
+    min_distance: Mm,
+    // How far away from a_start along a is closest to any point of b.
+    along_a_distance: Mm,
+    // How far away from b_start along b is closest to any point of a.
+    along_b_distance: Mm,
+}
+
+#[allow(dead_code)]
+fn closest_points_between_segments(
+    a_start: &Point,
+    a_end: &Point,
+    b_start: &Point,
+    b_end: &Point,
+) -> ClosestPointsBetweenSegmentsResult {
+    let p1 = a_start;
+    let p2 = a_end;
+    let p3 = b_start;
+    let p4 = b_end;
+
+    let v21 = *p2 - *p1;
+    let dot_21_21 = v21.dot(v21);
+    let v43 = *p4 - *p3;
+    let dot_43_43 = v43.dot(v43);
+    let v31 = *p3 - *p1;
+    let dot_31_21 = v31.dot(v21);
+    let v41 = *p4 - *p1;
+    let dot_41_21 = v41.dot(v21);
+    let v43 = *p4 - *p3;
+    let dot_43_21 = v43.dot(v21);
+    let dot_43_31 = v43.dot(v31);
+    let v32 = *p3 - *p2;
+    let dot_43_32 = v43.dot(v32);
+
+    let denom = dot_43_21 * dot_43_21 - dot_21_21 * dot_43_43;
+    let s = (dot_43_21 * dot_43_31 - dot_31_21 * dot_43_43) / denom;
+    let t = (dot_43_31 * dot_21_21 - dot_43_21 * dot_31_21) / denom;
+
+    if s >= 0.0 && s <= 1.0 && t >= 0.0 && t <= 1.0 {
+        // Closest points are within the two segments, so the closest points are the same as the
+        // closest points between two lines.
+        let min_distance = ((*p1 + v21 * s) - (*p3 + v43 * t)).norm();
+        let along_a_distance = v21.norm() * s;
+        let along_b_distance = v43.norm() * t;
+        return ClosestPointsBetweenSegmentsResult {
+            min_distance,
+            along_a_distance,
+            along_b_distance,
+        };
+    }
+
+    // Closest points are not within one or the other or both segments, so at this point we have 4
+    // cases. We compute the distance of each of these cases and pick the one with lowest distance.
+
+    let s_along_a_closest_to_b_start = (dot_31_21 / dot_21_21).clamp(0.0, 1.0);
+    let s_along_a_closest_to_b_end = (dot_41_21 / dot_21_21).clamp(0.0, 1.0);
+    let t_along_b_closest_to_a_start = (-dot_43_31 / dot_43_43).clamp(0.0, 1.0);
+    let t_along_b_closest_to_a_end = (-dot_43_32 / dot_43_43).clamp(0.0, 1.0);
+
+    let p_along_a_closest_to_b_start = *a_start + v21 * s_along_a_closest_to_b_start;
+    let p_along_a_closest_to_b_end = *a_start + v21 * s_along_a_closest_to_b_end;
+    let p_along_b_closest_to_a_start = *b_start + v43 * t_along_b_closest_to_a_start;
+    let p_along_b_closest_to_a_end = *b_start + v43 * t_along_b_closest_to_a_end;
+
+    let b_start_to_a_norm = (p_along_a_closest_to_b_start - *b_start).norm();
+    let b_end_to_a_norm = (p_along_a_closest_to_b_end - *b_end).norm();
+    let a_start_to_b_norm = (p_along_b_closest_to_a_start - *a_start).norm();
+    let a_end_to_b_norm = (p_along_b_closest_to_a_end - *a_end).norm();
+
+    struct CaseSpec {
+        distance: Mm,
+        along_a_distance: Mm,
+        along_b_distance: Mm,
+    }
+
+    let cases = &[
+        CaseSpec {
+            distance: b_start_to_a_norm,
+            along_a_distance: v21.norm() * s_along_a_closest_to_b_start,
+            along_b_distance: 0.0,
+        },
+        CaseSpec {
+            distance: b_end_to_a_norm,
+            along_a_distance: v21.norm() * s_along_a_closest_to_b_end,
+            along_b_distance: v43.norm(),
+        },
+        CaseSpec {
+            distance: a_start_to_b_norm,
+            along_a_distance: 0.0,
+            along_b_distance: v43.norm() * t_along_b_closest_to_a_start,
+        },
+        CaseSpec {
+            distance: a_end_to_b_norm,
+            along_a_distance: v21.norm(),
+            along_b_distance: v43.norm() * t_along_b_closest_to_a_end,
+        },
+    ];
+
+    let mut remap = vec![0usize, 1usize, 2usize, 3usize];
+    remap.sort_by(|a, b| OrderedFloat(cases[*a].distance).cmp(&OrderedFloat(cases[*b].distance)));
+
+    let winner = &cases[remap[0]];
+
+    ClosestPointsBetweenSegmentsResult {
+        min_distance: winner.distance,
+        along_a_distance: winner.along_a_distance,
+        along_b_distance: winner.along_b_distance,
+    }
+}
 
 // A fine sclicing layer.
 #[derive(Debug)]
@@ -434,16 +522,17 @@ pub struct Layer {
     kd_tree: KdTree,
 }
 
-//struct FindClosestToSegmentResult<'a> {
-//    // The location in the layer which is closest to any part of the query segment.
-//    layer_cursor: LayerCursor<'a>,
-//    // The location along the query segment which is closest to any part of any segment of the
-//    // layer.
-//    distance_along_query_segment: Mm,
-//    // The distance from the point implied by layer_cursor to the point implied by the query
-//    // segment and distance_along_query_segment.
-//    separation_distance: Mm,
-//}
+#[allow(dead_code)]
+struct FindClosestToSegmentResult<'a> {
+    // The location in the layer which is closest to any part of the query segment.
+    layer_cursor: LayerCursor<'a>,
+    // The location along the query segment which is closest to any part of any segment of the
+    // layer.
+    distance_along_query_segment: Mm,
+    // The distance from the point implied by layer_cursor to the point implied by the query
+    // segment and distance_along_query_segment.
+    separation_distance: Mm,
+}
 
 struct DistanceAndCursor<'a> {
     distance: Mm,
@@ -474,9 +563,15 @@ fn point_segment_min_distance(
 impl Layer {
     // Returns the closest point in the layer to any point on the query segment, and returns how
     // far along the query segment achieves the minimum distance. The minimum distance.
-    //    fn find_closest_to_segment(&self, query_start: &Point, query_end: &Point, within_distance: Mm) -> FindClosestToSegmentResult {
-    //        todo!();
-    //    }
+    #[allow(unused)]
+    fn find_closest_to_segment(
+        &self,
+        query_start: &Point,
+        query_end: &Point,
+        within_distance: Mm,
+    ) -> FindClosestToSegmentResult {
+        todo!();
+    }
 
     fn point_segment_index_min_distance(
         &self,
@@ -1313,10 +1408,76 @@ fn generate_output(
 mod tests {
     use super::*;
 
+    fn assert_close(a: Mm, b: Mm) {
+        if (a - b).abs() < 0.00001 {
+            return;
+        }
+        assert_eq!(a, b);
+    }
+
     #[test]
-    fn it_works() {
-        panic!("no tests yet");
-        //let result = 2 + 2;
-        //assert_eq!(result, 4);
+    fn test_closest_points_between_segments() {
+        // Case 1 - line-to-line distance
+        let a_start = Point {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        let a_end = Point {
+            x: 1.0,
+            y: 1.0,
+            z: 1.0,
+        };
+        let b_start = Point {
+            x: 0.0,
+            y: 1.0,
+            z: 0.0,
+        };
+        let b_end = Point {
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+        };
+        let result = closest_points_between_segments(&a_start, &a_end, &b_start, &b_end);
+        let a_norm = (a_end - a_start).norm();
+        let b_norm = (b_end - b_start).norm();
+        let s = result.along_a_distance / a_norm;
+        let t = result.along_b_distance / b_norm;
+        assert_close(s, 3.0 / 4.0);
+        assert_close(t, 1.0 / 4.0);
+        assert_close(result.min_distance, 2.0_f32.sqrt() / 2.0);
+
+        // Case 2 - point-to-line distance (because off end of segment a)
+        let a_start = Point {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        let a_end = Point {
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+        };
+        let b_start = Point {
+            x: 1.0,
+            y: 1.0,
+            z: 1.0,
+        };
+        let b_end = Point {
+            x: 2.0,
+            y: 3.0,
+            z: 5.0,
+        };
+        let result = closest_points_between_segments(&a_start, &a_end, &b_start, &b_end);
+        let a_norm = (a_end - a_start).norm();
+        let b_norm = (b_end - b_start).norm();
+        let s = result.along_a_distance / a_norm;
+        let t = result.along_b_distance / b_norm;
+        // off the end of line a, so needs to correctly use end of a, so clamp s to 1.0 (just 1.0 overall)
+        assert_close(s, (5.0_f32 / 4.0_f32).clamp(0.0, 1.0));
+        // (({1, 2, 3}-{1, 1, 1}).(({2, 3, 5}-{1, 1, 1})/norm({2, 3, 5}-{1, 1, 1})))/norm({2, 3, 5}-{1, 1, 1})
+        assert_close(t, 10.0 / 21.0);
+        // closest points on Point(1, 2, 3) and Line((1, 1, 1), (2, 3, 5))
+        assert_close(result.min_distance, (5.0_f32 / 21.0_f32).sqrt());
     }
 }
