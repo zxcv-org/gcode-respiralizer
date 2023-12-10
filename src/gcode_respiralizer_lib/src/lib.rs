@@ -1,8 +1,10 @@
 use kiddo::{self, SquaredEuclidean};
+use merging_iterator::MergeIter;
+use ordered_float::OrderedFloat;
 use rand::Rng;
 use regex::Regex;
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque, BTreeMap};
 use std::f32::consts::PI;
 use std::fmt::Write as fmt_Write;
 use std::fs;
@@ -10,6 +12,8 @@ use std::io::{self, BufRead, Write};
 use std::ops;
 use std::rc::Rc;
 use std::time::Instant;
+use std::ops::Bound::Excluded;
+use std::ops::Bound::Included;
 
 // ideas:
 //   * if gt 90 degrees from original segment (and part of zig zag zig), then skip?
@@ -86,6 +90,9 @@ pub use f32 as Factor;
 pub use f32 as Radians;
 pub use u32 as PointIndex;
 
+// We give up if we don't find any fine slicing points within this distance. When this threshold is
+// exceeded, it's likely to mean that the fine slicing and coarse slicing aren't aligned.
+const FIRST_Z_MAX_DISTANCE_DEFAULT: Mm = 3.0;
 // TODO: Make this a command-line argument, with this as the default, or with this scaled by the
 // auto-detected coarse vase slicing layer height.
 //
@@ -153,11 +160,11 @@ pub fn process_files(
     let fine_layers =
         read_fine_layers(file_lines(fine_reference_filename).expect("file_lines failed"));
     let read_layers_elapsed = before_read_layers.elapsed();
+    let kd_tree_points = fine_layers.layers.iter().map(|(_z, layer)| {layer.kd_tree.size()}).fold(0, |accum, size| {accum+size});
     println!(
-        "done reading fine layers - points: {} segment_runs: {} kd_tree points: {} elapsed: {:.2?}",
-        fine_layers.points.len(),
-        fine_layers.segment_runs.len(),
-        fine_layers.kd_tree.size(),
+        "done reading fine layers - layers: {} kd_tree points: {} elapsed: {:.2?}",
+        fine_layers.layers.len(),
+        kd_tree_points,
         read_layers_elapsed
     );
 
@@ -372,63 +379,211 @@ impl ops::Neg for Vec3 {
     }
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-struct SegmentRun {
-    // eg. 0 means point 0 starts segment 0 of this SegmentRun
-    start: PointIndex,
-    // eg. 10 means the last segment starts at point index 9 and ends at point
-    // index 10
-    end: PointIndex,
+//struct ClosestPointsBetweenSegmentsResult {
+//    // The minmum distance between a and b. This takes into account the fact that a and b are
+//    // segments, not lines.
+//    min_distance: Mm,
+//    // How far away from a_start along a is closest to any point of b.
+//    along_a_distance: Mm,
+//    // How far away from b_start along b is closest to any point of a.
+//    along_b_distance: Mm,
+//}
+//
+//fn closest_points_between_segments(a_start: &Point, a_end: &Point, b_start: &Point, b_end: &Point) -> ClosestPointsBetweenSegmentsResult {
+//    panic!("impl");
+//
+//    let a_vec = *a_end - *a_start;
+//    let b_vec = *b_end - *b_start;
+//    let a_norm = a_vec.norm();
+//    let b_norm = b_vec.norm();
+//    // A non-unit vector normal to the two planes which are parallel to each other. One plane
+//    // contains both points of a and the other plane contains both points of b.
+//    let normal_direction = a_vec.cross(b_vec);
+//    // A vector from a point of a to point of b.
+//    let arb_b_minus_arb_a = *b_end - *a_end;
+//    ClosestPointsBetweenSegmentsResult { min_distance: 0.0, along_a_distance: 0.0, along_b_distance: 0.0 }
+//}
+
+// A fine sclicing layer.
+#[derive(Debug)]
+pub struct Layer {
+    // All the points of a layer have the same z. The intro line is detected as having negative y,
+    // not included in any layer, and the coarse gcode is passed through for any G1 that doesn't
+    // include explicit Z, which passes through the intro line and any horizontally-sliced bottom
+    // coarse layers, without reference to any fine layer.
+    z: Mm,
+
+    // These are all the points with Point.z == z, in fine gcode order. Each layer is assumed to be
+    // a loop, so there is also a (fabricated/replaced/patched in/implicit) segment from
+    // `points[points.len() - 1]` to `points[0]``.
+    points: Vec<Point>,
+
+    // We use KdTree instead of ImmutableKdTree for these reasons:
+    //   * No need to build a big slice with more entries than G1(s) in the fine gcode, in addition
+    //     to the tree itself.
+    //   * ImmutableKdTree can't have multiple entries that map to the same index, unlike KdTree
+    //     which can.
+    //
+    // Each entry in kd_tree is the end point of a sub-segment with max length
+    // MAX_SUBSEGMENT_LENGTH, with index into points (above). The kd_tree has no filtering by layer
+    // aside from just the z distances increasing as we get further away in z from a layer.
+    kd_tree: KdTree,
 }
 
-impl PartialOrd for SegmentRun {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        return Some(self.cmp(other));
+//struct FindClosestToSegmentResult<'a> {
+//    // The location in the layer which is closest to any part of the query segment.
+//    layer_cursor: LayerCursor<'a>,
+//    // The location along the query segment which is closest to any part of any segment of the
+//    // layer.
+//    distance_along_query_segment: Mm,
+//    // The distance from the point implied by layer_cursor to the point implied by the query
+//    // segment and distance_along_query_segment.
+//    separation_distance: Mm,
+//}
+
+struct DistanceAndCursor<'a> {
+    distance: Mm,
+    layer_cursor: LayerCursor<'a>,
+}
+
+struct DistanceAndDistanceAlongSegment {
+    distance: Mm,
+    distance_along_segment: Mm,
+}
+
+fn point_segment_min_distance(point: &Point, segment_start: &Point, segment_end: &Point) -> DistanceAndDistanceAlongSegment {
+    let clamped_loc_perp_intersect = clamp_point_to_segment(*point, *segment_start, *segment_end);
+    let loc_minus_clamped_loc_perp_intersect = *point - clamped_loc_perp_intersect;
+    let distance = loc_minus_clamped_loc_perp_intersect.norm();
+    let along_segment = clamped_loc_perp_intersect - *segment_start;
+    let distance_along_segment = along_segment.norm();
+    DistanceAndDistanceAlongSegment{distance, distance_along_segment}
+}
+
+impl Layer {
+    // Returns the closest point in the layer to any point on the query segment, and returns how
+    // far along the query segment achieves the minimum distance. The minimum distance.
+//    fn find_closest_to_segment(&self, query_start: &Point, query_end: &Point, within_distance: Mm) -> FindClosestToSegmentResult {
+//        todo!();
+//    }
+
+    fn point_segment_index_min_distance(&self, query: &Point, segment_start_index: PointIndex) -> DistanceAndCursor {
+        let segment_start = self.points[segment_start_index as usize];
+        let segment_end_index = (segment_start_index as usize + 1) % self.points.len();
+        let segment_end = self.points[segment_end_index as usize];
+        let distance_and_distance_along_segment = point_segment_min_distance(query, &segment_start, &segment_end);
+        DistanceAndCursor { distance: distance_and_distance_along_segment.distance, layer_cursor: LayerCursor{layer: self, segment_start_index: segment_start_index, distance_along_segment: distance_and_distance_along_segment.distance_along_segment} }
     }
 }
 
-impl Ord for SegmentRun {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // We never make any that partially overlap or abut, so no need to handle those.
-        assert!(
-            self.start == other.start && self.end == other.end
-                || self.end < other.start
-                || self.start > other.end
-        );
-        if self.end < other.start {
-            return std::cmp::Ordering::Less;
+// All the fine slicing layers. The intro line is excluded (detected via negative y).
+#[derive(Debug)]
+pub struct Layers {
+    // key: z of the layer
+    layers: BTreeMap<OrderedFloat<Mm>, Layer>,
+}
+
+impl Layers {
+    // returns distance to the cursor and the cursor, of the closest point in any segment of any layer, to the query point
+    fn point_min_distance(&self, query: &Point, within_distance: Mm, exclude_z: Option<Mm>) -> Option<DistanceAndCursor> {
+        let mut checked_segments: HashSet<PointIndex> = HashSet::new();
+        let mut min_distance_so_far = within_distance + 0.01;
+        let mut min_distance_cursor_so_far: Option<LayerCursor> = None;
+        // Workaround for MergeIter::with_custom_ordering only accepting a function pointer not a closure.
+        struct ZLayerAndQuery<'a> {
+            z: Mm,
+            layer: &'a Layer,
+            query_z: Mm,
         }
-        if self.start > other.end {
-            return std::cmp::Ordering::Greater;
+        let ge_iter = self.layers.range((Included(OrderedFloat(query.z)), Included(OrderedFloat(query.z + within_distance)))).map(|z_layer| {ZLayerAndQuery{
+            z: **z_layer.0,
+            layer: z_layer.1,
+            query_z: query.z,
+        }});
+        let lt_iter = self.layers.range((Included(OrderedFloat(query.z - within_distance)), Excluded(OrderedFloat(query.z)))).rev().map(|z_layer| {ZLayerAndQuery{
+            z: **z_layer.0,
+            layer: z_layer.1,
+            query_z: query.z,
+        }});
+        let merged_by_distance = MergeIter::with_custom_ordering(lt_iter, ge_iter, |a, b| {(a.z - a.query_z).abs() < (b.z - b.query_z).abs()}).filter(|z_layer_and_query|{exclude_z.is_none() || z_layer_and_query.z != exclude_z.unwrap()});
+        for z_layer_and_query in merged_by_distance {
+            let layer = z_layer_and_query.layer;
+            if (layer.z - query.z).abs() > min_distance_so_far {
+                break;
+            }
+            checked_segments.clear();
+            let kd_query_point = &[query.x, query.y, query.z];
+            let max_possible_distance_of_kd_tree_point_of_best_segment: Mm = min_distance_so_far + MAX_SUBSEGMENT_LENGTH + KD_TREE_FUDGE_RADIUS;
+            let squared_euclidean_distance = max_possible_distance_of_kd_tree_point_of_best_segment * max_possible_distance_of_kd_tree_point_of_best_segment;
+            // We'd use within_unsorted_iter(), except that seems to have a stack overflow (only
+            // sometimes), so instead we use within_unsorted().
+            //
+            // TODO: post issue, preferably with repro I guess, like by setting constant rng seed.
+            let neighbours = layer.kd_tree.within_unsorted::<SquaredEuclidean>(kd_query_point, squared_euclidean_distance);
+            for neighbour in neighbours {
+                let candidate_segment_start_index = neighbour.item;
+
+                // multiple sub-segments of the same segment can be returned
+                if checked_segments.contains(&candidate_segment_start_index) {
+                    // we already checked the actual segment, so we don't need to re-check it having
+                    // found it again via a different sub-segment's kd_tree point
+                    continue;
+                }
+                checked_segments.insert(candidate_segment_start_index);
+
+                let DistanceAndCursor{distance: candidate_distance, layer_cursor: candidate_cursor } = layer.point_segment_index_min_distance(query, candidate_segment_start_index);
+                if candidate_distance >= min_distance_so_far {
+                    continue;
+                }
+
+                min_distance_so_far = candidate_distance;
+                min_distance_cursor_so_far = Some(candidate_cursor);
+            }
         }
-        assert!(self.start == other.start && self.end == other.end);
-        return std::cmp::Ordering::Equal;
+        if min_distance_so_far > within_distance {
+            return None;
+        }
+        assert!(min_distance_cursor_so_far.is_some());
+        Some(DistanceAndCursor{distance: min_distance_so_far, layer_cursor: min_distance_cursor_so_far.expect("bug?")})
     }
 }
 
 #[derive(Debug)]
-pub struct Layers {
-    // These are at least all the fine gcode points that have an extrusion to the point or away
-    // from the point. Points which have no adjacent extrusion can be omitted since we don't need
-    // any travel/travel points. We rely on all of retract/detract/extra detract to be 0.0 in
-    // slicer settings. We detect and fail on negative extrusion so we'll notice retracts if user
-    // forgets to disable.
-    points: Vec<Point>,
+pub struct LayerCursor<'a> {
+    layer: &'a Layer,
+    segment_start_index: PointIndex,
+    distance_along_segment: Mm,
+}
 
-    // Exactly all the contiguous runs of extruding moves, including the intro line.
-    segment_runs: BTreeSet<SegmentRun>,
-
-    // We use KdTree instead of ImmutableKdTree for these reasons:
-    //   * No need to build a big slice with more entries than G1(s) in the fine
-    //     gcode, in addition to the tree itself.
-    //   * ImmutableKdTree can't have multiple entries that map to the same
-    //     index, unlike KdTree which can.
-    //
-    // Each entry in kd_tree is the end point of a sub-segment with max length
-    // MAX_SUBSEGMENT_LENGTH, with index into points (above). The kd_tree has no
-    // filtering by layer aside from just the z distances increasing as we get
-    // further away in z from a layer.
-    kd_tree: KdTree,
+impl LayerCursor<'_> {
+    fn get_point(&self) -> Point {
+        let start = self.layer.points[self.segment_start_index as usize];
+        let end = self.layer.points[(self.segment_start_index as usize + 1) % self.layer.points.len()];
+        let end_minus_start = end - start;
+        let end_minus_start_len = end_minus_start.norm();
+        let end_minus_start_direction = end_minus_start / end_minus_start_len;
+        start + end_minus_start_direction * self.distance_along_segment
+    }
+    // This will advance by at most max_distance along the perimeter, and will loop from the end
+    // of the fine slicing perimeter back to the start of the fine slicing perimeter, treating the
+    // end to start segment as a normal segment. Each call will advance by a non-zero positive
+    // amount, and is guaranteed to not entirely skip any segments.
+//    fn advance_by_at_most(&mut self, max_distance: Mm) {
+//        self.distance_along_segment += max_distance;
+//        let segment_start = self.layer.points[self.segment_start_index as usize];
+//        let segment_end_index = (self.segment_start_index as usize + 1) % self.layer.points.len();
+//        let segment_end = self.layer.points[segment_end_index as usize];
+//        let segment_length = (segment_end - segment_start).norm();
+//        if self.distance_along_segment > segment_length {
+//            self.segment_start_index += 1;
+//            if self.segment_start_index as usize == self.layer.points.len() {
+//                self.segment_start_index = 0;
+//            }
+//            // Since we don't ever want to skip an entire segment, we may as well start at 0.0
+//            // along the new segment.
+//            self.distance_along_segment = 0.0;
+//        }
+//    }
 }
 
 #[derive(Debug, Default)]
@@ -573,63 +728,62 @@ pub fn process_lines(
     println!("g1_count: {}", g1_count);
 }
 
+// ~190ms before.
 pub fn read_fine_layers(gcode_lines: io::Lines<io::BufReader<std::fs::File>>) -> Layers {
-    let mut points: Vec<Point> = vec![];
-    let mut segment_runs: BTreeSet<SegmentRun> = BTreeSet::new();
-    let mut kd_tree: KdTree = KdTree::new();
-
-    let mut cur_segment_run: Option<SegmentRun> = None;
+    let mut layers = Layers{layers: BTreeMap::new()};
 
     let mut g1_handler = |c: G1LineContext| {
         if !c.opt_extrude.is_some() {
             // println!("no extrude");
-            if cur_segment_run.is_some() {
-                segment_runs.insert(cur_segment_run.take().unwrap());
-            }
             return;
         }
 
-        match cur_segment_run.as_mut() {
-            Some(run) => {
-                run.end += 1;
-            }
-            None => {
-                assert!(
-                    segment_runs.is_empty()
-                        || (segment_runs.last().unwrap().end as usize) < points.len()
-                );
-                cur_segment_run = Some(SegmentRun {
-                    start: (points.len() as u32),
-                    end: ((points.len() + 1) as u32),
-                });
-                points.push(c.old_loc.clone());
-            }
-        };
-        points.push(c.g.loc.clone());
+        if c.g.loc.y < 0.0 {
+            // intro line
+            return;
+        }
 
-        // We ensure that each point on the segment is within MAX_SUBSEGMENT_LENGTH of a point
-        // added to kd_tree.
+        if c.g.loc.z != c.old_loc.z {
+            panic!("fine sliced gcode is changing z while extruding? - fine should be sliced with vase mode off, retraction/detraction/extra detraction off - see README.md");
+        }
+
+        let layer : &mut Layer;
+        if let Some(existing_layer) = layers.layers.get_mut(&OrderedFloat(c.g.loc.z)) {
+            layer = existing_layer;
+        } else {
+            let prev_layer = layers.layers.insert(OrderedFloat(c.g.loc.z), Layer { z: c.g.loc.z, points: vec![], kd_tree: KdTree::new()});
+            assert!(prev_layer.is_none());
+            layer = layers.layers.get_mut(&OrderedFloat(c.g.loc.z)).unwrap();
+            layer.points.push(c.old_loc.clone());
+        }
+        layer.points.push(c.g.loc.clone());
+
+        // We ensure that each point on the segment is within MAX_SUBSEGMENT_LENGTH plus
+        // KD_TREE_FUDGE_RADIUS of a point added to kd_tree.
 
         let segment_delta = c.g.loc - c.old_loc;
         // dbg!(segment_delta);
         let segment_length = segment_delta.norm();
-        // dbg!(segment_length);
+        // The slicer shouldn't extrude without moving, so this won't be a divide by zero. If it is
+        // a divide by zero, that's a problem with the fine slicing. We just let the divide by zero
+        // happen here if the slicer messed up.
         let segment_direction_unit = segment_delta / segment_length;
         // dbg!(segment_direction_unit);
 
-        let mut i = 0u32;
-        // the segment goes from point[point_index] to point[point_index + 1]
-        let point_index = points.len() - 2;
-        let segment_start_point = points[point_index];
-        let segment_end_point = points[point_index + 1];
+        let points = &mut layer.points;
+        // grab the just-inserted segment
+        let point_index : PointIndex = (points.len() - 2).try_into().unwrap();
+        let segment_start_point = points[point_index as usize];
+        let segment_end_point = points[point_index as usize + 1];
         if segment_start_point.z != segment_end_point.z {
             dbg!(segment_start_point);
             dbg!(segment_end_point);
             dbg!(c.opt_extrude);
             // We don't expect the fine vase-esque slicing to be extruding while changing z
-            panic!("ensure fine vase-esque gcode slicing has vase mode un-checked");
+            panic!("ensure fine slicing has vase mode un-checked");
         }
         // println!("start: {:?}", segment_start_point);
+        let mut i = 0u32;
         loop {
             let new_point_distance_from_start = MAX_SUBSEGMENT_LENGTH * (i as Factor);
             // dbg!(new_point_distance_from_start);
@@ -645,7 +799,7 @@ pub fn read_fine_layers(gcode_lines: io::Lines<io::BufReader<std::fs::File>>) ->
             };
             // dbg!(new_point_clean);
             // dbg!(new_point_fudged);
-            kd_tree.add(
+            layer.kd_tree.add(
                 &[new_point_fudged.x, new_point_fudged.y, new_point_fudged.z],
                 point_index.try_into().unwrap(),
             );
@@ -662,11 +816,7 @@ pub fn read_fine_layers(gcode_lines: io::Lines<io::BufReader<std::fs::File>>) ->
 
     process_lines(gcode_lines, &mut line_handler);
 
-    Layers {
-        points,
-        segment_runs,
-        kd_tree,
-    }
+    layers
 }
 
 fn clamp_point_to_segment(loc: Point, segment_start: Point, segment_end: Point) -> Point {
@@ -682,33 +832,12 @@ fn clamp_point_to_segment(loc: Point, segment_start: Point, segment_end: Point) 
     clamped_loc_perp_intersect
 }
 
-fn point_segment_distance(loc: Point, segment_start: Point, segment_end: Point) -> Mm {
-    let clamped_loc_perp_intersect = clamp_point_to_segment(loc, segment_start, segment_end);
-    let loc_minus_clamped_loc_perp_intersect = loc - clamped_loc_perp_intersect;
-    let distance = loc_minus_clamped_loc_perp_intersect.norm();
-    distance
-}
-
-fn point_segment_index_distance(
-    layers: &Layers,
-    loc: Point,
-    segment_start_point_index: PointIndex,
-) -> Mm {
-    let segment_start = layers.points[segment_start_point_index as usize];
-    let segment_end = layers.points[segment_start_point_index as usize + 1];
-    let real_distance = point_segment_distance(loc, segment_start, segment_end);
-    real_distance
-}
-
-fn clamp_point_to_segment_index(
-    layers: &Layers,
-    loc: Point,
-    segment_start_point_index: PointIndex,
-) -> Point {
-    let segment_start = layers.points[segment_start_point_index as usize];
-    let segment_end = layers.points[segment_start_point_index as usize + 1];
-    clamp_point_to_segment(loc, segment_start, segment_end)
-}
+//fn point_segment_distance(loc: Point, segment_start: Point, segment_end: Point) -> Mm {
+//    let clamped_loc_perp_intersect = clamp_point_to_segment(loc, segment_start, segment_end);
+//    let loc_minus_clamped_loc_perp_intersect = loc - clamped_loc_perp_intersect;
+//    let distance = loc_minus_clamped_loc_perp_intersect.norm();
+//    distance
+//}
 
 struct ExtrudingG1 {
     // XYZ
@@ -963,164 +1092,43 @@ fn generate_output(
         let mut point_so_far: Point = c.g.loc;
         let mut refinement_step_ordinal = 0;
         loop {
-            let kd_query_point = &[point_so_far.x, point_so_far.y, point_so_far.z];
-            // TODO: Consider biasing the distance metric toward same-z candidates, to encourage fixing xy in fewer iterations.
-            let nearest_kd_neighbour = fine_layers
-                .kd_tree
-                .nearest_one::<kiddo::float::distance::SquaredEuclidean>(kd_query_point);
-            let segment_start_point_index = nearest_kd_neighbour.item;
+            let p1_distance_and_cursor = fine_layers.point_min_distance(&point_so_far, FIRST_Z_MAX_DISTANCE_DEFAULT, None).expect("p1 not found within FIRST_Z_MAX_DISTANCE_DEFAULT; fine slicing and coarse slicing not aligned?");
 
-            let mut best_distance_so_far =
-                point_segment_index_distance(&fine_layers, point_so_far, segment_start_point_index);
-            let mut checked_segments: HashSet<PointIndex> = HashSet::new();
-            checked_segments.insert(segment_start_point_index);
-            let mut best_segment_so_far = segment_start_point_index;
-
-            // To be sure that we've found the closest point on any segment, we have to expand the
-            // search radius for kd_tree points to be large enough to account for both
-            // MAX_SUBSEGMENT_LENGTH (in case the kd_tree point is MAX_SUBSEGMENT_LENGTH further away
-            // worst-case) and KD_TREE_FUDGE_RADIUS (in case the kd_tree point got fudged away by the
-            // max due to being diagonally point to furthest point across the fudge cube).
-
-            let max_possible_distance_of_kd_tree_point_of_best_segment: Mm =
-                best_distance_so_far + MAX_SUBSEGMENT_LENGTH + KD_TREE_FUDGE_RADIUS;
-            let squared_euclidean_distance = max_possible_distance_of_kd_tree_point_of_best_segment
-                * max_possible_distance_of_kd_tree_point_of_best_segment;
-            // We'd use within_unsorted_iter(), except that seems to have a stack overflow (only
-            // sometimes), so instead we use within_unsorted().
+            // Now we want a p2_distance_and_cursor, that is not in the same layer as
+            // p1_distance_and_cursor. This means we want to filter out the z value of
+            // p1_distance_and_cursor. Unfortunately, the kd_tree doesn't let us keep expanding the
+            // sphere and get points in increasing distance, nor does it let us query for the
+            // nearest point passing a filter. Because we'll be connecting the closest point
+            // p1_distance_and_cursor with the 2nd closest (with different z) point
+            // p2_distance_and_cursor to construct a segment ("construction segment"; not printed),
+            // and then using the point on that line that's closest to the z value of loc, we only
+            // really care about the actual geometry of p2_distance_and_cursor when the z value of
+            // p2_distance_and_cursor is in the opposite z direction from p1_distance_and_cursor,
+            // since if it's in the same z direction, we'll just end up clamping to the
+            // p1_distance_and_cursor end of the constructed segment anyway (we don't extrapolate
+            // beyond the ends of the construction segment since that could cause the output gcode
+            // to move backwards for short distances over already-printed perimeter when crossing a
+            // seam in the layer below).
             //
-            // TODO: post issue, preferably with repro I guess, like by setting constant rng seed.
-            let neighbours = fine_layers
-                .kd_tree
-                .within_unsorted::<SquaredEuclidean>(kd_query_point, squared_euclidean_distance);
-            let neighbours = neighbours.iter().map(|neighbour| neighbour.item);
-
-            // Can uncomment this if kd_tree seems possibly sus.
-            //let mut neighbours : Vec<u32> = vec!();
-            //for segment_run in &fine_layers.segment_runs {
-            //    for segment_index in segment_run.start..segment_run.end {
-            //        neighbours.push(segment_index);
-            //    }
-            //}
-
-            for neighbour in neighbours {
-                let candidate_segment_start_index = neighbour;
-
-                // multiple sub-segments of the same segment can be returned
-                if checked_segments.contains(&candidate_segment_start_index) {
-                    // we already checked the actual segment, so we don't need to re-check it having
-                    // found it again via a different sub-segment's kd_tree point
-                    continue;
-                }
-                checked_segments.insert(candidate_segment_start_index);
-
-                let candidate_distance = point_segment_index_distance(
-                    &fine_layers,
-                    point_so_far,
-                    candidate_segment_start_index,
-                );
-                if candidate_distance > best_distance_so_far {
-                    continue;
-                }
-
-                best_distance_so_far = candidate_distance;
-                best_segment_so_far = candidate_segment_start_index;
-            }
-
-            let best_segment_1 = best_segment_so_far;
-
-            // Now we want a best_segment_2, that is not in the same layer as best_segment_1. This
-            // means we want to expand the search again, and filter out the z value of
-            // best_segment_1. Unfortunately, the kd_tree doesn't let us keep expanding the sphere
-            // and get points in increasing distance, nor does it let us query for the nearest
-            // point passing a filter. Because we'll be connecting the closest point on
-            // best_segment_1 with the closest point on best_segment_2 to construct a segment
-            // ("construction segment"; not printed), and then using the point on that line that's
-            // closest to the z value of loc, we only really care about the actual geometry of
-            // best_segment_2 when the z value of best_segment_2 is in the opposite z direction
-            // from best_segment_1, since if it's in the same z direction, we'll just end up
-            // clamping to the best_segment_1 end of the constructed segment anyway (we don't
-            // extrapolate beyond the ends of the construction segment since that could cause the
-            // output gcode to move backwards for short distances over already-printed perimeter
-            // when crossing a seam in the layer below.
-            //
-            // By limiting the search for best_segment_2 to a reasonable distance, and just using
-            // best_segment_1 if we don't find a best_segment_2, we also make sure the intro line
-            // is just the intro line, and not some sort of mess. It also might handle particularly
-            // advanced designed-for-vase-mode isolated bridge-through-the-air-intentionally paths
-            // better, though that's TBV.
+            // By limiting the search for p2_distance_and_cursor to a reasonable distance, and just
+            // using p1_distance_and_cursor if we don't find a p2_distance_and_cursor, we might
+            // handle particularly advanced designed-for-vase-mode isolated
+            // bridge-through-the-air-intentionally paths better, though that's TBV.
             //
             // The case we really want to do well is when the z value of loc is between two fine
             // layers' z values, with the two fine layers each having a nearby point that's roughly
             // a fractional coarse layer height away from loc in z. At the "fudge line", the xy
-            // distance can be larger, but that's what all this code is designed to fix after all.
+            // distance can be larger.
             //
             // The threshold distance is a max distance from loc (not expanded by distance to
-            // best_segment_1), but to find candidates we still need to expand beyond that
-            // threshold distance similar to what we did for best_segment_1 above.
+            // p1_distance_and_cursor).
 
-            let exclude_z = fine_layers.points[best_segment_so_far as usize].z;
+            let exclude_z = p1_distance_and_cursor.layer_cursor.layer.z;
+            let p2_distance_and_cursor = fine_layers.point_min_distance(&point_so_far, OTHER_Z_MAX_DISTANCE_DEFAULT, Some(exclude_z));
 
-            // Expanding the kd_tree distance threshold below doesn't imply that we won't enforce
-            // the OTHER_Z_MAX_DISTANCE_DEFAULT when it comes to the actual distances found.
-            let mut best_distance_so_far = OTHER_Z_MAX_DISTANCE_DEFAULT;
-            // The best segment can remain None if we don't find anything that passes the filter
-            // any closer than OTHER_Z_MAX_DISTANCE_DEFAULT.
-            let mut best_segment_so_far: Option<PointIndex> = None;
-            checked_segments.clear();
-
-            let max_possible_distance_of_kd_tree_point_of_best_segment =
-                OTHER_Z_MAX_DISTANCE_DEFAULT + MAX_SUBSEGMENT_LENGTH + KD_TREE_FUDGE_RADIUS;
-            let squared_euclidean_distance = max_possible_distance_of_kd_tree_point_of_best_segment
-                * max_possible_distance_of_kd_tree_point_of_best_segment;
-
-            let neighbours = fine_layers
-                .kd_tree
-                .within_unsorted::<SquaredEuclidean>(kd_query_point, squared_euclidean_distance);
-            let neighbours = neighbours.iter().map(|neighbour| neighbour.item);
-
-            // Can uncomment this if kd_tree seems possibly sus.
-            //let mut neighbours : Vec<u32> = vec!();
-            //for segment_run in &fine_layers.segment_runs {
-            //    for segment_index in segment_run.start..segment_run.end {
-            //        neighbours.push(segment_index);
-            //    }
-            //}
-
-            for neighbour in neighbours {
-                let candidate_segment_start_index = neighbour;
-
-                if checked_segments.contains(&candidate_segment_start_index) {
-                    continue;
-                }
-                checked_segments.insert(candidate_segment_start_index);
-
-                let candidate_segment_z =
-                    fine_layers.points[candidate_segment_start_index as usize].z;
-                // The z values are all parsed from the same ascii or copied, so == should work for
-                // this since they should be bit-for-bit the same (or not the same z).
-                if candidate_segment_z == exclude_z {
-                    continue;
-                }
-
-                let candidate_distance = point_segment_index_distance(
-                    &fine_layers,
-                    point_so_far,
-                    candidate_segment_start_index,
-                );
-                if candidate_distance > best_distance_so_far {
-                    continue;
-                }
-
-                best_distance_so_far = candidate_distance;
-                best_segment_so_far = Some(candidate_segment_start_index);
-            }
-            let best_segment_2 = best_segment_so_far;
-
-            let best_point_1 =
-                clamp_point_to_segment_index(&fine_layers, point_so_far, best_segment_1);
-            let best_point_2 = best_segment_2.map(|segment_start_index| {
-                clamp_point_to_segment_index(&fine_layers, point_so_far, segment_start_index)
+            let best_point_1 = p1_distance_and_cursor.layer_cursor.get_point();
+            let best_point_2 = p2_distance_and_cursor.map(|distance_and_cursor| {
+                distance_and_cursor.layer_cursor.get_point()
             });
 
             let old_point_so_far = point_so_far;
@@ -1133,17 +1141,10 @@ fn generate_output(
                     z: loc_z,
                 };
             } else {
-                let best_segment_2 = best_segment_2.unwrap();
                 let best_point_2 = best_point_2.unwrap();
                 if best_point_1.z == best_point_2.z {
-                    dbg!(best_segment_1);
-                    dbg!(best_segment_2);
                     dbg!(best_point_1);
                     dbg!(best_point_2);
-                    dbg!(fine_layers.points[best_segment_1 as usize]);
-                    dbg!(fine_layers.points[best_segment_1 as usize + 1]);
-                    dbg!(fine_layers.points[best_segment_2 as usize]);
-                    dbg!(fine_layers.points[best_segment_2 as usize + 1]);
                 }
                 assert!(
                     best_point_1.z != best_point_2.z,
@@ -1173,7 +1174,6 @@ fn generate_output(
                         z: loc_z,
                     };
                 } else {
-                    // barycentric-ish
                     let high_z_factor = (loc_z - low_z_point.z) / (high_z_point.z - low_z_point.z);
                     let high_minus_low = high_z_point - low_z_point;
                     let tmp_point = low_z_point + high_minus_low * high_z_factor;
