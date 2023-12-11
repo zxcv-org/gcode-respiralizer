@@ -1149,38 +1149,44 @@ impl ExtrudingG1Buffer {
             middle = *p2 - *p1;
             let middle_norm = middle.norm();
             if middle_norm > MIDDLE_SHORT_ENOUGH_THRESH {
-                // g.back_mut().unwrap().lines_after_g1.push("; middle_norm > MIDDLE_SHORT_ENOUGH_THRESH".into());
+                // g.back_mut().unwrap().lines_after_g1.push("; middle_norm >
+                // MIDDLE_SHORT_ENOUGH_THRESH".into());
                 return;
             }
             let first = *p1 - *p0;
             first_norm = first.norm();
             if first_norm < FIRST_AND_LAST_LONG_ENOUGH_THRESH {
-                // g.back_mut().unwrap().lines_after_g1.push("; first_norm < FIRST_AND_LAST_LONG_ENOUGH_THRESH".into());
+                // g.back_mut().unwrap().lines_after_g1.push("; first_norm <
+                // FIRST_AND_LAST_LONG_ENOUGH_THRESH".into());
                 return;
             }
             let last = *p3 - *p2;
             last_norm = last.norm();
             if last_norm < FIRST_AND_LAST_LONG_ENOUGH_THRESH {
-                // g.back_mut().unwrap().lines_after_g1.push("; last_norm < FIRST_AND_LAST_LONG_ENOUGH_THRESH".into());
+                // g.back_mut().unwrap().lines_after_g1.push("; last_norm <
+                // FIRST_AND_LAST_LONG_ENOUGH_THRESH".into());
                 return;
             }
             let first_unit = first / first_norm;
             let last_unit = last / last_norm;
             let first_last_radians = first_unit.dot(last_unit).acos();
             if first_last_radians > SAME_DIRECTION_THRESH {
-                // g.back_mut().unwrap().lines_after_g1.push("; first_last_radians > SAME_DIRECTION_THRESH".into());
+                // g.back_mut().unwrap().lines_after_g1.push("; first_last_radians >
+                // SAME_DIRECTION_THRESH".into());
                 return;
             }
             let first_unit_cross_middle = first_unit.cross(middle);
             let first_unit_cross_middle_norm = first_unit_cross_middle.norm();
             if first_unit_cross_middle_norm / 2.0 > GCODE_RESOLUTION_THRESH {
-                // g.back_mut().unwrap().lines_after_g1.push("; first_unit_cross_middle_norm / 2.0 > GCODE_RESOLUTION_THRESH".into());
+                // g.back_mut().unwrap().lines_after_g1.push("; first_unit_cross_middle_norm / 2.0
+                // > GCODE_RESOLUTION_THRESH".into());
                 return;
             }
             let last_unit_cross_middle = last_unit.cross(middle);
             let last_unit_cross_middle_norm = last_unit_cross_middle.norm();
             if last_unit_cross_middle_norm / 2.0 > GCODE_RESOLUTION_THRESH {
-                // g.back_mut().unwrap().lines_after_g1.push("; last_unit_cross_middle_norm / 2.0 > GCODE_RESOLUTION_THRESH".into());
+                // g.back_mut().unwrap().lines_after_g1.push("; last_unit_cross_middle_norm / 2.0 >
+                // GCODE_RESOLUTION_THRESH".into());
                 return;
             }
         }
@@ -1328,8 +1334,8 @@ fn generate_output(
             }
             if !c.opt_extrude.is_some() || !c.has_explicit_z {
                 self.output_buffer.queue_line(c.line.as_str());
-                // We don't worry about this point being non-corrected. Technically "wrong" but doesn't
-                // matter enough to worry about.
+                // We don't worry about this point being non-corrected. Technically "wrong" but
+                // doesn't matter enough to worry about.
                 self.old_loc = c.g.loc;
                 return;
             }
@@ -1337,33 +1343,35 @@ fn generate_output(
             let mut point_so_far: Point = c.g.loc;
             let mut refinement_step_ordinal = 0;
             loop {
-                let p1_distance_and_cursor = self.fine_layers.point_min_distance(&point_so_far, FIRST_Z_MAX_DISTANCE_DEFAULT, None).expect("p1 not found within FIRST_Z_MAX_DISTANCE_DEFAULT; fine slicing and coarse slicing not aligned?");
+                let p1_distance_and_cursor = self.fine_layers.point_min_distance(
+                    &point_so_far, FIRST_Z_MAX_DISTANCE_DEFAULT, None)
+                    .expect("p1 not found within FIRST_Z_MAX_DISTANCE_DEFAULT; fine slicing and coarse slicing not aligned?");
 
                 // Now we want a p2_distance_and_cursor, that is not in the same layer as
                 // p1_distance_and_cursor. This means we want to filter out the z value of
-                // p1_distance_and_cursor. Unfortunately, the kd_tree doesn't let us keep expanding the
-                // sphere and get points in increasing distance, nor does it let us query for the
-                // nearest point passing a filter. Because we'll be connecting the closest point
-                // p1_distance_and_cursor with the 2nd closest (with different z) point
-                // p2_distance_and_cursor to construct a segment ("construction segment"; not printed),
-                // and then using the point on that line that's closest to the z value of loc, we only
-                // really care about the actual geometry of p2_distance_and_cursor when the z value of
-                // p2_distance_and_cursor is in the opposite z direction from p1_distance_and_cursor,
-                // since if it's in the same z direction, we'll just end up clamping to the
-                // p1_distance_and_cursor end of the constructed segment anyway (we don't extrapolate
-                // beyond the ends of the construction segment since that could cause the output gcode
-                // to move backwards for short distances over already-printed perimeter when crossing a
-                // seam in the layer below).
+                // p1_distance_and_cursor. Unfortunately, the kd_tree doesn't let us keep expanding
+                // the sphere and get points in increasing distance, nor does it let us query for
+                // the nearest point passing a filter. Because we'll be connecting the closest
+                // point p1_distance_and_cursor with the 2nd closest (with different z) point
+                // p2_distance_and_cursor to construct a segment ("construction segment"; not
+                // printed), and then using the point on that line that's closest to the z value of
+                // loc, we only really care about the actual geometry of p2_distance_and_cursor
+                // when the z value of p2_distance_and_cursor is in the opposite z direction from
+                // p1_distance_and_cursor, since if it's in the same z direction, we'll just end up
+                // clamping to the p1_distance_and_cursor end of the constructed segment anyway (we
+                // don't extrapolate beyond the ends of the construction segment since that could
+                // cause the output gcode to move backwards for short distances over
+                // already-printed perimeter when crossing a seam in the layer below).
                 //
-                // By limiting the search for p2_distance_and_cursor to a reasonable distance, and just
-                // using p1_distance_and_cursor if we don't find a p2_distance_and_cursor, we might
-                // handle particularly advanced designed-for-vase-mode isolated
+                // By limiting the search for p2_distance_and_cursor to a reasonable distance, and
+                // just using p1_distance_and_cursor if we don't find a p2_distance_and_cursor, we
+                // might handle particularly advanced designed-for-vase-mode isolated
                 // bridge-through-the-air-intentionally paths better, though that's TBV.
                 //
-                // The case we really want to do well is when the z value of loc is between two fine
-                // layers' z values, with the two fine layers each having a nearby point that's roughly
-                // a fractional coarse layer height away from loc in z. At the "fudge line", the xy
-                // distance can be larger.
+                // The case we really want to do well is when the z value of loc is between two
+                // fine layers' z values, with the two fine layers each having a nearby point
+                // that's roughly a fractional coarse layer height away from loc in z. At the
+                // "fudge line", the xy distance can be larger.
                 //
                 // The threshold distance is a max distance from loc (not expanded by distance to
                 // p1_distance_and_cursor).
@@ -1571,9 +1579,11 @@ mod tests {
         let b_norm = (b_end - b_start).norm();
         let s = result.along_a_distance / a_norm;
         let t = result.along_b_distance / b_norm;
-        // off the end of line a, so needs to correctly use end of a, so clamp s to 1.0 (just 1.0 overall)
+        // off the end of line a, so needs to correctly use end of a, so clamp s to 1.0 (just 1.0
+        // overall)
         assert_close(s, (5.0_f32 / 4.0_f32).clamp(0.0, 1.0));
-        // (({1, 2, 3}-{1, 1, 1}).(({2, 3, 5}-{1, 1, 1})/norm({2, 3, 5}-{1, 1, 1})))/norm({2, 3, 5}-{1, 1, 1})
+        // (({1, 2, 3}-{1, 1, 1}).(({2, 3, 5}-{1, 1, 1})/norm({2, 3, 5}-{1, 1, 1})))/norm({2, 3,
+        // 5}-{1, 1, 1})
         assert_close(t, 10.0 / 21.0);
         // closest points on Point(1, 2, 3) and Line((1, 1, 1), (2, 3, 5))
         assert_close(result.min_distance, (5.0_f32 / 21.0_f32).sqrt());
