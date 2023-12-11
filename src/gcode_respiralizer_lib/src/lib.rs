@@ -3,6 +3,7 @@ use merging_iterator::MergeIter;
 use ordered_float::OrderedFloat;
 use rand::Rng;
 use regex::Regex;
+use std::cell::{RefCell, RefMut};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::f32::consts::PI;
 use std::fmt::Write as fmt_Write;
@@ -11,6 +12,7 @@ use std::io::{self, BufRead, Write};
 use std::ops;
 use std::ops::Bound::Excluded;
 use std::ops::Bound::Included;
+use std::rc::{Rc, Weak};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::thread;
 use std::time::Instant;
@@ -117,6 +119,8 @@ const REFINEMENT_GOOD_ENOUGH_TO_STOP_UPDATE_DISTANCE: Mm = 0.001;
 // segments (while evaluating the reasonable-ness of doing so), we need 4 points.
 const MAX_G1_BUFFERED: usize = 4;
 
+const ENTIRE_SEGMENT: Mm = Mm::MAX / 2.0;
+
 // TODO: Get this from std when/if available there, and/or switch to const version of sqrt if/when
 // that's a thing.
 const FRAC_1_SQRT_3: Mm = 0.5773502691896257;
@@ -166,7 +170,7 @@ pub fn process_files(
     let kd_tree_points = fine_layers
         .layers
         .iter()
-        .map(|(_z, layer)| layer.kd_tree.size())
+        .map(|(_z, layer)| layer.borrow().kd_tree.size())
         .fold(0, |accum, size| accum + size);
     println!(
         "done reading fine layers - layers: {} kd_tree points: {} elapsed: {:.2?}",
@@ -502,6 +506,8 @@ fn closest_points_between_segments(
 // A fine sclicing layer.
 #[derive(Debug)]
 pub struct Layer {
+    weak_self: Weak<RefCell<Layer>>,
+
     // All the points of a layer have the same z. The intro line is detected as having negative y,
     // not included in any layer, and the coarse gcode is passed through for any G1 that doesn't
     // include explicit Z, which passes through the intro line and any horizontally-sliced bottom
@@ -526,9 +532,9 @@ pub struct Layer {
 }
 
 #[allow(dead_code)]
-struct FindClosestToSegmentResult<'a> {
+struct FindClosestToSegmentResult {
     // The location in the layer which is closest to any part of the query segment.
-    layer_cursor: LayerCursor<'a>,
+    layer_cursor: LayerCursor,
     // The location along the query segment which is closest to any part of any segment of the
     // layer.
     distance_along_query_segment: Mm,
@@ -537,9 +543,9 @@ struct FindClosestToSegmentResult<'a> {
     separation_distance: Mm,
 }
 
-struct DistanceAndCursor<'a> {
+struct DistanceAndCursor {
     distance: Mm,
-    layer_cursor: LayerCursor<'a>,
+    layer_cursor: LayerCursor,
 }
 
 struct DistanceAndDistanceAlongSegment {
@@ -589,7 +595,7 @@ impl Layer {
         DistanceAndCursor {
             distance: distance_and_distance_along_segment.distance,
             layer_cursor: LayerCursor {
-                layer: self,
+                layer: self.weak_self.upgrade().expect("upgrade failed"),
                 segment_start_index: segment_start_index,
                 distance_along_segment: distance_and_distance_along_segment.distance_along_segment,
             },
@@ -600,8 +606,8 @@ impl Layer {
 // All the fine slicing layers. The intro line is excluded (detected via negative y).
 #[derive(Debug)]
 pub struct Layers {
-    // key: z of the layer
-    layers: BTreeMap<OrderedFloat<Mm>, Layer>,
+    // key: z of the layer; we use Rc because LayerCursor needs to refer to layers also
+    layers: BTreeMap<OrderedFloat<Mm>, Rc<RefCell<Layer>>>,
 }
 
 impl Layers {
@@ -616,9 +622,9 @@ impl Layers {
         let mut min_distance_so_far = within_distance + 0.01;
         let mut min_distance_cursor_so_far: Option<LayerCursor> = None;
         // Workaround for MergeIter::with_custom_ordering only accepting a function pointer not a closure.
-        struct ZLayerAndQuery<'a> {
+        struct ZLayerAndQuery {
             z: Mm,
-            layer: &'a Layer,
+            layer: Rc<RefCell<Layer>>,
             query_z: Mm,
         }
         let ge_iter = self
@@ -629,7 +635,7 @@ impl Layers {
             ))
             .map(|z_layer| ZLayerAndQuery {
                 z: **z_layer.0,
-                layer: z_layer.1,
+                layer: z_layer.1.clone(),
                 query_z: query.z,
             });
         let lt_iter = self
@@ -641,7 +647,7 @@ impl Layers {
             .rev()
             .map(|z_layer| ZLayerAndQuery {
                 z: **z_layer.0,
-                layer: z_layer.1,
+                layer: z_layer.1.clone(),
                 query_z: query.z,
             });
         let merged_by_distance = MergeIter::with_custom_ordering(lt_iter, ge_iter, |a, b| {
@@ -651,7 +657,7 @@ impl Layers {
             exclude_z.is_none() || z_layer_and_query.z != exclude_z.unwrap()
         });
         for z_layer_and_query in merged_by_distance {
-            let layer = z_layer_and_query.layer;
+            let layer = z_layer_and_query.layer.borrow();
             if (layer.z - query.z).abs() > min_distance_so_far {
                 break;
             }
@@ -703,42 +709,44 @@ impl Layers {
 }
 
 #[derive(Debug)]
-pub struct LayerCursor<'a> {
-    layer: &'a Layer,
+pub struct LayerCursor {
+    layer: Rc<RefCell<Layer>>,
     segment_start_index: PointIndex,
     distance_along_segment: Mm,
 }
 
-impl LayerCursor<'_> {
+impl LayerCursor {
     fn get_point(&self) -> Point {
-        let start = self.layer.points[self.segment_start_index as usize];
-        let end =
-            self.layer.points[(self.segment_start_index as usize + 1) % self.layer.points.len()];
+        let layer = self.layer.borrow();
+        let start = layer.points[self.segment_start_index as usize];
+        let end = layer.points[(self.segment_start_index as usize + 1) % layer.points.len()];
         let end_minus_start = end - start;
         let end_minus_start_len = end_minus_start.norm();
         let end_minus_start_direction = end_minus_start / end_minus_start_len;
         start + end_minus_start_direction * self.distance_along_segment
     }
+
     // This will advance by at most max_distance along the perimeter, and will loop from the end
     // of the fine slicing perimeter back to the start of the fine slicing perimeter, treating the
     // end to start segment as a normal segment. Each call will advance by a non-zero positive
     // amount, and is guaranteed to not entirely skip any segments.
-    //    fn advance_by_at_most(&mut self, max_distance: Mm) {
-    //        self.distance_along_segment += max_distance;
-    //        let segment_start = self.layer.points[self.segment_start_index as usize];
-    //        let segment_end_index = (self.segment_start_index as usize + 1) % self.layer.points.len();
-    //        let segment_end = self.layer.points[segment_end_index as usize];
-    //        let segment_length = (segment_end - segment_start).norm();
-    //        if self.distance_along_segment > segment_length {
-    //            self.segment_start_index += 1;
-    //            if self.segment_start_index as usize == self.layer.points.len() {
-    //                self.segment_start_index = 0;
-    //            }
-    //            // Since we don't ever want to skip an entire segment, we may as well start at 0.0
-    //            // along the new segment.
-    //            self.distance_along_segment = 0.0;
-    //        }
-    //    }
+    fn advance_by_at_most(&mut self, max_distance: Mm) {
+        let layer = self.layer.borrow();
+        self.distance_along_segment += max_distance;
+        let segment_start = layer.points[self.segment_start_index as usize];
+        let segment_end_index = (self.segment_start_index as usize + 1) % layer.points.len();
+        let segment_end = layer.points[segment_end_index as usize];
+        let segment_length = (segment_end - segment_start).norm();
+        if self.distance_along_segment > segment_length {
+            self.segment_start_index += 1;
+            if self.segment_start_index as usize == layer.points.len() {
+                self.segment_start_index = 0;
+            }
+            // Since we don't ever want to skip an entire segment, we may as well start at 0.0
+            // along the new segment.
+            self.distance_along_segment = 0.0;
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -905,24 +913,28 @@ pub fn read_fine_layers(gcode_lines: io::Lines<io::BufReader<std::fs::File>>) ->
                 panic!("fine sliced gcode is changing z while extruding? - fine should be sliced with vase mode off, retraction/detraction/extra detraction off - see README.md");
             }
 
-            let layer: &mut Layer;
+            let mut layer: RefMut<Layer>;
             if let Some(existing_layer) = self.layers.layers.get_mut(&OrderedFloat(c.g.loc.z)) {
-                layer = existing_layer;
+                layer = existing_layer.borrow_mut();
             } else {
-                let prev_layer = self.layers.layers.insert(
-                    OrderedFloat(c.g.loc.z),
-                    Layer {
-                        z: c.g.loc.z,
-                        points: vec![],
-                        kd_tree: KdTree::new(),
-                    },
-                );
+                let new_layer_rc = Rc::new(RefCell::new(Layer {
+                    weak_self: Weak::default(),
+                    z: c.g.loc.z,
+                    points: vec![],
+                    kd_tree: KdTree::new(),
+                }));
+                new_layer_rc.borrow_mut().weak_self = Rc::downgrade(&new_layer_rc);
+                let prev_layer = self
+                    .layers
+                    .layers
+                    .insert(OrderedFloat(c.g.loc.z), new_layer_rc);
                 assert!(prev_layer.is_none());
                 layer = self
                     .layers
                     .layers
                     .get_mut(&OrderedFloat(c.g.loc.z))
-                    .unwrap();
+                    .unwrap()
+                    .borrow_mut();
                 layer.points.push(c.old_loc.clone());
             }
             layer.points.push(c.g.loc.clone());
@@ -1306,9 +1318,11 @@ fn generate_output(
         max_iterations_exceeded_count: u64,
         good_enough_before_max_iterations_count: u64,
         old_loc: Point,
+        old_p1_cursor: Option<LayerCursor>,
+        old_p2_cursor: Option<LayerCursor>,
         fine_layers: Layers,
     }
-    impl GcodeLineHandler for DownstreamCoarseHandler {
+    impl<'a> GcodeLineHandler for DownstreamCoarseHandler {
         fn handle_g1(&mut self, c: G1LineContext) {
             if c.g.loc == c.old_loc && !c.opt_extrude.is_some() {
                 let mut new_line = String::new();
@@ -1342,6 +1356,8 @@ fn generate_output(
             //println!("<<<< {}", c.line);
             let mut point_so_far: Point = c.g.loc;
             let mut refinement_step_ordinal = 0;
+            let mut p1_cursor: Option<LayerCursor> = None;
+            let mut p2_cursor: Option<LayerCursor> = None;
             loop {
                 let p1_distance_and_cursor = self.fine_layers.point_min_distance(
                     &point_so_far, FIRST_Z_MAX_DISTANCE_DEFAULT, None)
@@ -1376,7 +1392,7 @@ fn generate_output(
                 // The threshold distance is a max distance from loc (not expanded by distance to
                 // p1_distance_and_cursor).
 
-                let exclude_z = p1_distance_and_cursor.layer_cursor.layer.z;
+                let exclude_z = p1_distance_and_cursor.layer_cursor.layer.borrow().z;
                 let p2_distance_and_cursor = self.fine_layers.point_min_distance(
                     &point_so_far,
                     OTHER_Z_MAX_DISTANCE_DEFAULT,
@@ -1385,6 +1401,7 @@ fn generate_output(
 
                 let best_point_1 = p1_distance_and_cursor.layer_cursor.get_point();
                 let best_point_2 = p2_distance_and_cursor
+                    .as_ref()
                     .map(|distance_and_cursor| distance_and_cursor.layer_cursor.get_point());
 
                 let old_point_so_far = point_so_far;
@@ -1455,6 +1472,9 @@ fn generate_output(
                     self.good_enough_before_max_iterations_count += 1;
                     break;
                 }
+
+                p1_cursor = Some(p1_distance_and_cursor.layer_cursor);
+                p2_cursor = p2_distance_and_cursor.map(|it| it.layer_cursor);
             }
             let new_point = point_so_far;
 
@@ -1476,6 +1496,8 @@ fn generate_output(
             });
 
             self.old_loc = new_point;
+            self.old_p1_cursor = p1_cursor;
+            self.old_p2_cursor = p2_cursor;
         }
 
         fn handle_default(&mut self, s: &str) {
@@ -1495,6 +1517,8 @@ fn generate_output(
         max_iterations_exceeded_count: 0,
         good_enough_before_max_iterations_count: 0,
         old_loc: Point::default(),
+        old_p1_cursor: None,
+        old_p2_cursor: None,
         fine_layers,
     };
 
