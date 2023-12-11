@@ -1268,13 +1268,13 @@ fn handler_channel(channel_capacity: usize) -> (Box<dyn GcodeLineHandler + Send>
     impl GcodeLineHandler for UpstreamCoarseLineHandler {
         fn handle_g1(&mut self, g1: G1LineContext) {
             let item = GcodeInputHandlerItem::G1(g1);
-            self.tx.send(item).expect("send must work");
+            self.tx.send(item).expect("send failed");
         }
 
         fn handle_default(&mut self, line: &str) {
             self.tx
                 .send(GcodeInputHandlerItem::Default(line.into()))
-                .expect("send must work");
+                .expect("send failed");
         }
     }
 
@@ -1477,8 +1477,9 @@ fn generate_output(
 
     let (mut tx_handler, mut rx_buffer) = handler_channel(512);
 
-    thread::spawn(move || {
+    let coarse_reader_thread = thread::spawn(move || {
         process_lines(coarse_gcode_lines, tx_handler.as_mut());
+        println!("coarse reader thread done");
     });
 
     let mut coarse_handler = DownstreamCoarseHandler {
@@ -1491,6 +1492,8 @@ fn generate_output(
 
     rx_buffer.process_lines(&mut coarse_handler);
     coarse_handler.output_buffer.flush();
+
+    coarse_reader_thread.join().expect("join failed");
 
     println!(
         "max_iterations_exceeded_count: {} good_enough_before_max_iterations_count: {}",
