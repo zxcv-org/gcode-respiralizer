@@ -11,9 +11,9 @@ use std::io::{self, BufRead, Write};
 use std::ops;
 use std::ops::Bound::Excluded;
 use std::ops::Bound::Included;
-use std::time::Instant;
-use std::thread;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::thread;
+use std::time::Instant;
 
 // ideas:
 //   * if gt 90 degrees from original segment (and part of zig zag zig), then skip?
@@ -895,16 +895,16 @@ pub fn read_fine_layers(gcode_lines: io::Lines<io::BufReader<std::fs::File>>) ->
                 // println!("no extrude");
                 return;
             }
-    
+
             if c.g.loc.y < 0.0 {
                 // intro line
                 return;
             }
-    
+
             if c.g.loc.z != c.old_loc.z {
                 panic!("fine sliced gcode is changing z while extruding? - fine should be sliced with vase mode off, retraction/detraction/extra detraction off - see README.md");
             }
-    
+
             let layer: &mut Layer;
             if let Some(existing_layer) = self.layers.layers.get_mut(&OrderedFloat(c.g.loc.z)) {
                 layer = existing_layer;
@@ -918,14 +918,18 @@ pub fn read_fine_layers(gcode_lines: io::Lines<io::BufReader<std::fs::File>>) ->
                     },
                 );
                 assert!(prev_layer.is_none());
-                layer = self.layers.layers.get_mut(&OrderedFloat(c.g.loc.z)).unwrap();
+                layer = self
+                    .layers
+                    .layers
+                    .get_mut(&OrderedFloat(c.g.loc.z))
+                    .unwrap();
                 layer.points.push(c.old_loc.clone());
             }
             layer.points.push(c.g.loc.clone());
-    
+
             // We ensure that each point on the segment is within MAX_SUBSEGMENT_LENGTH plus
             // KD_TREE_FUDGE_RADIUS of a point added to kd_tree.
-    
+
             let segment_delta = c.g.loc - c.old_loc;
             // dbg!(segment_delta);
             let segment_length = segment_delta.norm();
@@ -934,7 +938,7 @@ pub fn read_fine_layers(gcode_lines: io::Lines<io::BufReader<std::fs::File>>) ->
             // happen here if the slicer messed up.
             let segment_direction_unit = segment_delta / segment_length;
             // dbg!(segment_direction_unit);
-    
+
             let points = &mut layer.points;
             // grab the just-inserted segment
             let point_index: PointIndex = (points.len() - 2).try_into().unwrap();
@@ -974,8 +978,10 @@ pub fn read_fine_layers(gcode_lines: io::Lines<io::BufReader<std::fs::File>>) ->
 
         fn handle_default(&mut self, _line: &str) {}
     }
-    let mut line_handler = FineLineHandler{
-        layers: Layers { layers: BTreeMap::new() }
+    let mut line_handler = FineLineHandler {
+        layers: Layers {
+            layers: BTreeMap::new(),
+        },
     };
 
     process_lines(gcode_lines, &mut line_handler);
@@ -1213,7 +1219,6 @@ impl ExtrudingG1Buffer {
     }
 }
 
-
 #[derive(Debug)]
 enum GcodeInputHandlerItem {
     G1(G1LineContext),
@@ -1228,14 +1233,12 @@ struct RxBuffer {
 
 impl RxBuffer {
     fn process_lines(&mut self, line_handler: &mut dyn GcodeLineHandler) {
-        let mut handle_item = move |item: GcodeInputHandlerItem| {
-            match item {
-                GcodeInputHandlerItem::G1(g1) => {
-                    line_handler.handle_g1(g1);
-                },
-                GcodeInputHandlerItem::Default(line) => {
-                    line_handler.handle_default(&line);
-                }
+        let mut handle_item = move |item: GcodeInputHandlerItem| match item {
+            GcodeInputHandlerItem::G1(g1) => {
+                line_handler.handle_g1(g1);
+            }
+            GcodeInputHandlerItem::Default(line) => {
+                line_handler.handle_default(&line);
             }
         };
         loop {
@@ -1269,15 +1272,20 @@ fn handler_channel(channel_capacity: usize) -> (Box<dyn GcodeLineHandler + Send>
         }
 
         fn handle_default(&mut self, line: &str) {
-            self.tx.send(GcodeInputHandlerItem::Default(line.into())).expect("send must work");
+            self.tx
+                .send(GcodeInputHandlerItem::Default(line.into()))
+                .expect("send must work");
         }
     }
 
     let (tx, rx) = sync_channel(channel_capacity);
 
-    let upstream_handler = Box::new(UpstreamCoarseLineHandler{tx});
+    let upstream_handler = Box::new(UpstreamCoarseLineHandler { tx });
 
-    let rx_buffer = RxBuffer{rx, first: VecDeque::new()};
+    let rx_buffer = RxBuffer {
+        rx,
+        first: VecDeque::new(),
+    };
 
     (upstream_handler, rx_buffer)
 }
@@ -1330,7 +1338,7 @@ fn generate_output(
             let mut refinement_step_ordinal = 0;
             loop {
                 let p1_distance_and_cursor = self.fine_layers.point_min_distance(&point_so_far, FIRST_Z_MAX_DISTANCE_DEFAULT, None).expect("p1 not found within FIRST_Z_MAX_DISTANCE_DEFAULT; fine slicing and coarse slicing not aligned?");
-    
+
                 // Now we want a p2_distance_and_cursor, that is not in the same layer as
                 // p1_distance_and_cursor. This means we want to filter out the z value of
                 // p1_distance_and_cursor. Unfortunately, the kd_tree doesn't let us keep expanding the
@@ -1359,20 +1367,20 @@ fn generate_output(
                 //
                 // The threshold distance is a max distance from loc (not expanded by distance to
                 // p1_distance_and_cursor).
-    
+
                 let exclude_z = p1_distance_and_cursor.layer_cursor.layer.z;
                 let p2_distance_and_cursor = self.fine_layers.point_min_distance(
                     &point_so_far,
                     OTHER_Z_MAX_DISTANCE_DEFAULT,
                     Some(exclude_z),
                 );
-    
+
                 let best_point_1 = p1_distance_and_cursor.layer_cursor.get_point();
                 let best_point_2 = p2_distance_and_cursor
                     .map(|distance_and_cursor| distance_and_cursor.layer_cursor.get_point());
-    
+
                 let old_point_so_far = point_so_far;
-    
+
                 let loc_z = c.g.loc.z;
                 if best_point_2.is_none() {
                     point_so_far = Point {
@@ -1414,7 +1422,8 @@ fn generate_output(
                             z: loc_z,
                         };
                     } else {
-                        let high_z_factor = (loc_z - low_z_point.z) / (high_z_point.z - low_z_point.z);
+                        let high_z_factor =
+                            (loc_z - low_z_point.z) / (high_z_point.z - low_z_point.z);
                         let high_minus_low = high_z_point - low_z_point;
                         let tmp_point = low_z_point + high_minus_low * high_z_factor;
                         // should be very close to equal
@@ -1426,13 +1435,13 @@ fn generate_output(
                         };
                     }
                 }
-    
+
                 refinement_step_ordinal += 1;
                 if refinement_step_ordinal >= REFINEMENT_MAX_ITERATIONS {
                     self.max_iterations_exceeded_count += 1;
                     break;
                 }
-    
+
                 let update_vec = point_so_far - old_point_so_far;
                 if update_vec.norm() < REFINEMENT_GOOD_ENOUGH_TO_STOP_UPDATE_DISTANCE {
                     self.good_enough_before_max_iterations_count += 1;
@@ -1440,24 +1449,24 @@ fn generate_output(
                 }
             }
             let new_point = point_so_far;
-    
+
             let old_move_distance = (c.g.loc - c.old_loc).norm();
             let old_extrude = c.opt_extrude.unwrap();
             let new_move_distance = (new_point - self.old_loc).norm();
             let new_extrude = old_extrude * new_move_distance / old_move_distance;
-    
+
             //dbg!(old_move_distance);
             //dbg!(old_extrude);
             //dbg!(new_move_distance);
             //dbg!(new_extrude);
-    
+
             self.output_buffer.queue_g1(ExtrudingG1 {
                 point: new_point,
                 extrude: new_extrude,
                 opt_f: c.opt_f,
                 opt_comment: c.opt_comment.map(|s| s.into()),
             });
-    
+
             self.old_loc = new_point;
         }
 
@@ -1472,14 +1481,21 @@ fn generate_output(
         process_lines(coarse_gcode_lines, tx_handler.as_mut());
     });
 
-    let mut coarse_handler = DownstreamCoarseHandler{output_buffer: ExtrudingG1Buffer::new(buf_writer), max_iterations_exceeded_count: 0, good_enough_before_max_iterations_count: 0, old_loc: Point::default(), fine_layers};
+    let mut coarse_handler = DownstreamCoarseHandler {
+        output_buffer: ExtrudingG1Buffer::new(buf_writer),
+        max_iterations_exceeded_count: 0,
+        good_enough_before_max_iterations_count: 0,
+        old_loc: Point::default(),
+        fine_layers,
+    };
 
     rx_buffer.process_lines(&mut coarse_handler);
     coarse_handler.output_buffer.flush();
 
     println!(
         "max_iterations_exceeded_count: {} good_enough_before_max_iterations_count: {}",
-        coarse_handler.max_iterations_exceeded_count, coarse_handler.good_enough_before_max_iterations_count
+        coarse_handler.max_iterations_exceeded_count,
+        coarse_handler.good_enough_before_max_iterations_count
     );
 }
 
