@@ -3,7 +3,6 @@ use merging_iterator::MergeIter;
 use ordered_float::OrderedFloat;
 use rand::Rng;
 use regex::Regex;
-use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::f32::consts::PI;
 use std::fmt::Write as fmt_Write;
@@ -12,8 +11,9 @@ use std::io::{self, BufRead, Write};
 use std::ops;
 use std::ops::Bound::Excluded;
 use std::ops::Bound::Included;
-use std::rc::Rc;
 use std::time::Instant;
+use std::thread;
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 
 // ideas:
 //   * if gt 90 degrees from original segment (and part of zig zag zig), then skip?
@@ -159,6 +159,9 @@ pub fn process_files(
     let before_read_layers = Instant::now();
     let fine_layers =
         read_fine_layers(file_lines(fine_reference_filename).expect("file_lines failed"));
+    // Maybe use multiple threads to parse and build KdTree(s) faster, since mostly independent per
+    // z layer of the fine slicing, aside from breaking the input file into lines. Detecting a new
+    // layer does require parsing Z though...
     let read_layers_elapsed = before_read_layers.elapsed();
     let kd_tree_points = fine_layers
         .layers
@@ -738,7 +741,7 @@ impl LayerCursor<'_> {
     //    }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct GcodeState {
     // initially assumed 0,0,0 (ignoring homing which is assumed)
     loc: Point,
@@ -752,24 +755,25 @@ fn kd_fudge() -> Mm {
     rand::thread_rng().gen::<Mm>() * KD_TREE_FUDGE_PER_COMPONENT
 }
 
-pub struct G1LineContext<'a> {
-    line: &'a str,
+#[derive(Clone, Debug)]
+pub struct G1LineContext {
+    line: String,
     old_loc: Point,
-    g: &'a GcodeState,
+    g: GcodeState,
     has_explicit_z: bool,
     opt_extrude: Option<Mm>,
     opt_f: Option<Mm>,
-    opt_comment: Option<&'a str>,
+    opt_comment: Option<String>,
 }
 
-pub struct GcodeLineHandler<'a> {
-    pub g1_handler: &'a mut dyn FnMut(G1LineContext),
-    pub default_handler: &'a mut dyn FnMut(&str),
+pub trait GcodeLineHandler {
+    fn handle_g1(&mut self, g1: G1LineContext);
+    fn handle_default(&mut self, line: &str);
 }
 
 pub fn process_lines(
     gcode_lines: io::Lines<io::BufReader<std::fs::File>>,
-    line_handler: &mut GcodeLineHandler,
+    line_handler: &mut dyn GcodeLineHandler,
 ) {
     let g90_abs = Regex::new(r"^G90[^0-9a-zA-Z].*$").unwrap();
     let g91_rel = Regex::new(r"^G91[^0-9a-zA-Z].*$").unwrap();
@@ -794,7 +798,7 @@ pub fn process_lines(
             let old_loc = g.loc.clone();
             let xyzef = g1_captures.name("xyzef").unwrap().as_str();
             let opt_comment = match g1_captures.name("comment") {
-                Some(m) => Some(m.as_str()),
+                Some(m) => Some(m.as_str().into()),
                 None => None,
             };
             let opt_extrude: Option<Mm>;
@@ -845,18 +849,18 @@ pub fn process_lines(
             }
 
             let g1_line_context = G1LineContext {
-                line: &line,
+                line,
                 old_loc,
-                g: &g,
+                g: g.clone(),
                 has_explicit_z,
                 opt_extrude,
                 opt_f,
                 opt_comment,
             };
-            (line_handler.g1_handler)(g1_line_context);
+            line_handler.handle_g1(g1_line_context);
             continue;
         }
-        (line_handler.default_handler)(line.as_str());
+        line_handler.handle_default(line.as_str());
         if !g.is_rel_e && m83_rel_e.is_match(&line) {
             g.is_rel_e = true;
             // println!("line: {} is_rel_e = true", line_number);
@@ -882,102 +886,102 @@ pub fn process_lines(
 
 // ~190ms before.
 pub fn read_fine_layers(gcode_lines: io::Lines<io::BufReader<std::fs::File>>) -> Layers {
-    let mut layers = Layers {
-        layers: BTreeMap::new(),
-    };
-
-    let mut g1_handler = |c: G1LineContext| {
-        if !c.opt_extrude.is_some() {
-            // println!("no extrude");
-            return;
-        }
-
-        if c.g.loc.y < 0.0 {
-            // intro line
-            return;
-        }
-
-        if c.g.loc.z != c.old_loc.z {
-            panic!("fine sliced gcode is changing z while extruding? - fine should be sliced with vase mode off, retraction/detraction/extra detraction off - see README.md");
-        }
-
-        let layer: &mut Layer;
-        if let Some(existing_layer) = layers.layers.get_mut(&OrderedFloat(c.g.loc.z)) {
-            layer = existing_layer;
-        } else {
-            let prev_layer = layers.layers.insert(
-                OrderedFloat(c.g.loc.z),
-                Layer {
-                    z: c.g.loc.z,
-                    points: vec![],
-                    kd_tree: KdTree::new(),
-                },
-            );
-            assert!(prev_layer.is_none());
-            layer = layers.layers.get_mut(&OrderedFloat(c.g.loc.z)).unwrap();
-            layer.points.push(c.old_loc.clone());
-        }
-        layer.points.push(c.g.loc.clone());
-
-        // We ensure that each point on the segment is within MAX_SUBSEGMENT_LENGTH plus
-        // KD_TREE_FUDGE_RADIUS of a point added to kd_tree.
-
-        let segment_delta = c.g.loc - c.old_loc;
-        // dbg!(segment_delta);
-        let segment_length = segment_delta.norm();
-        // The slicer shouldn't extrude without moving, so this won't be a divide by zero. If it is
-        // a divide by zero, that's a problem with the fine slicing. We just let the divide by zero
-        // happen here if the slicer messed up.
-        let segment_direction_unit = segment_delta / segment_length;
-        // dbg!(segment_direction_unit);
-
-        let points = &mut layer.points;
-        // grab the just-inserted segment
-        let point_index: PointIndex = (points.len() - 2).try_into().unwrap();
-        let segment_start_point = points[point_index as usize];
-        let segment_end_point = points[point_index as usize + 1];
-        if segment_start_point.z != segment_end_point.z {
-            dbg!(segment_start_point);
-            dbg!(segment_end_point);
-            dbg!(c.opt_extrude);
-            // We don't expect the fine vase-esque slicing to be extruding while changing z
-            panic!("ensure fine slicing has vase mode un-checked");
-        }
-        // println!("start: {:?}", segment_start_point);
-        let mut i = 0u32;
-        loop {
-            let new_point_distance_from_start = MAX_SUBSEGMENT_LENGTH * (i as Factor);
-            // dbg!(new_point_distance_from_start);
-            if new_point_distance_from_start > segment_length {
-                break;
+    struct FineLineHandler {
+        layers: Layers,
+    }
+    impl GcodeLineHandler for FineLineHandler {
+        fn handle_g1(&mut self, c: G1LineContext) {
+            if !c.opt_extrude.is_some() {
+                // println!("no extrude");
+                return;
             }
-            let new_point_clean =
-                segment_start_point + segment_direction_unit * new_point_distance_from_start;
-            let new_point_fudged = Point {
-                x: new_point_clean.x + kd_fudge(),
-                y: new_point_clean.y + kd_fudge(),
-                z: new_point_clean.z + kd_fudge(),
-            };
-            // dbg!(new_point_clean);
-            // dbg!(new_point_fudged);
-            layer.kd_tree.add(
-                &[new_point_fudged.x, new_point_fudged.y, new_point_fudged.z],
-                point_index.try_into().unwrap(),
-            );
-            i += 1;
+    
+            if c.g.loc.y < 0.0 {
+                // intro line
+                return;
+            }
+    
+            if c.g.loc.z != c.old_loc.z {
+                panic!("fine sliced gcode is changing z while extruding? - fine should be sliced with vase mode off, retraction/detraction/extra detraction off - see README.md");
+            }
+    
+            let layer: &mut Layer;
+            if let Some(existing_layer) = self.layers.layers.get_mut(&OrderedFloat(c.g.loc.z)) {
+                layer = existing_layer;
+            } else {
+                let prev_layer = self.layers.layers.insert(
+                    OrderedFloat(c.g.loc.z),
+                    Layer {
+                        z: c.g.loc.z,
+                        points: vec![],
+                        kd_tree: KdTree::new(),
+                    },
+                );
+                assert!(prev_layer.is_none());
+                layer = self.layers.layers.get_mut(&OrderedFloat(c.g.loc.z)).unwrap();
+                layer.points.push(c.old_loc.clone());
+            }
+            layer.points.push(c.g.loc.clone());
+    
+            // We ensure that each point on the segment is within MAX_SUBSEGMENT_LENGTH plus
+            // KD_TREE_FUDGE_RADIUS of a point added to kd_tree.
+    
+            let segment_delta = c.g.loc - c.old_loc;
+            // dbg!(segment_delta);
+            let segment_length = segment_delta.norm();
+            // The slicer shouldn't extrude without moving, so this won't be a divide by zero. If it is
+            // a divide by zero, that's a problem with the fine slicing. We just let the divide by zero
+            // happen here if the slicer messed up.
+            let segment_direction_unit = segment_delta / segment_length;
+            // dbg!(segment_direction_unit);
+    
+            let points = &mut layer.points;
+            // grab the just-inserted segment
+            let point_index: PointIndex = (points.len() - 2).try_into().unwrap();
+            let segment_start_point = points[point_index as usize];
+            let segment_end_point = points[point_index as usize + 1];
+            if segment_start_point.z != segment_end_point.z {
+                dbg!(segment_start_point);
+                dbg!(segment_end_point);
+                dbg!(c.opt_extrude);
+                // We don't expect the fine vase-esque slicing to be extruding while changing z
+                panic!("ensure fine slicing has vase mode un-checked");
+            }
+            // println!("start: {:?}", segment_start_point);
+            let mut i = 0u32;
+            loop {
+                let new_point_distance_from_start = MAX_SUBSEGMENT_LENGTH * (i as Factor);
+                // dbg!(new_point_distance_from_start);
+                if new_point_distance_from_start > segment_length {
+                    break;
+                }
+                let new_point_clean =
+                    segment_start_point + segment_direction_unit * new_point_distance_from_start;
+                let new_point_fudged = Point {
+                    x: new_point_clean.x + kd_fudge(),
+                    y: new_point_clean.y + kd_fudge(),
+                    z: new_point_clean.z + kd_fudge(),
+                };
+                // dbg!(new_point_clean);
+                // dbg!(new_point_fudged);
+                layer.kd_tree.add(
+                    &[new_point_fudged.x, new_point_fudged.y, new_point_fudged.z],
+                    point_index.try_into().unwrap(),
+                );
+                i += 1;
+            }
         }
-    };
 
-    let mut default_handler = |_: &str| {};
-
-    let mut line_handler = GcodeLineHandler {
-        g1_handler: &mut g1_handler,
-        default_handler: &mut default_handler,
+        fn handle_default(&mut self, _line: &str) {}
+    }
+    let mut line_handler = FineLineHandler{
+        layers: Layers { layers: BTreeMap::new() }
     };
 
     process_lines(gcode_lines, &mut line_handler);
 
-    layers
+    // yoink
+    line_handler.layers
 }
 
 fn clamp_point_to_segment(loc: Point, segment_start: Point, segment_end: Point) -> Point {
@@ -1209,198 +1213,273 @@ impl ExtrudingG1Buffer {
     }
 }
 
+
+#[derive(Debug)]
+enum GcodeInputHandlerItem {
+    G1(G1LineContext),
+    Default(String),
+}
+
+struct RxBuffer {
+    rx: Receiver<GcodeInputHandlerItem>,
+    // These can be previously-peeked items and/or replacment items, and will be processed first.
+    first: VecDeque<GcodeInputHandlerItem>,
+}
+
+impl RxBuffer {
+    fn process_lines(&mut self, line_handler: &mut dyn GcodeLineHandler) {
+        let mut handle_item = move |item: GcodeInputHandlerItem| {
+            match item {
+                GcodeInputHandlerItem::G1(g1) => {
+                    line_handler.handle_g1(g1);
+                },
+                GcodeInputHandlerItem::Default(line) => {
+                    line_handler.handle_default(&line);
+                }
+            }
+        };
+        loop {
+            if let Some(item) = self.first.pop_front() {
+                handle_item(item);
+                continue;
+            }
+            match self.rx.recv() {
+                Ok(item) => {
+                    handle_item(item);
+                    continue;
+                }
+                Err(_e) => {
+                    assert!(self.first.is_empty());
+                    println!("input channel done");
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn handler_channel(channel_capacity: usize) -> (Box<dyn GcodeLineHandler + Send>, RxBuffer) {
+    struct UpstreamCoarseLineHandler {
+        tx: SyncSender<GcodeInputHandlerItem>,
+    }
+    impl GcodeLineHandler for UpstreamCoarseLineHandler {
+        fn handle_g1(&mut self, g1: G1LineContext) {
+            let item = GcodeInputHandlerItem::G1(g1);
+            self.tx.send(item).expect("send must work");
+        }
+
+        fn handle_default(&mut self, line: &str) {
+            self.tx.send(GcodeInputHandlerItem::Default(line.into())).expect("send must work");
+        }
+    }
+
+    let (tx, rx) = sync_channel(channel_capacity);
+
+    let upstream_handler = Box::new(UpstreamCoarseLineHandler{tx});
+
+    let rx_buffer = RxBuffer{rx, first: VecDeque::new()};
+
+    (upstream_handler, rx_buffer)
+}
+
 fn generate_output(
     fine_layers: Layers,
     coarse_gcode_lines: io::Lines<io::BufReader<std::fs::File>>,
     buf_writer: io::BufWriter<std::fs::File>,
 ) {
-    let output_buffer = Rc::new(RefCell::new(ExtrudingG1Buffer::new(buf_writer)));
-    let mut max_iterations_exceeded_count: u64 = 0;
-    let mut good_enough_before_max_iterations_count: u64 = 0;
-    let mut old_loc = Point::default();
-    let mut g1_handler = |c: G1LineContext| {
-        let mut output_buffer = output_buffer.borrow_mut();
-        if c.g.loc == c.old_loc && !c.opt_extrude.is_some() {
-            let mut new_line = String::new();
-            match c.opt_f {
-                None => {
-                    write!(&mut new_line, "; same pos, no E, no F, removed: {}", c.line)
+    struct DownstreamCoarseHandler {
+        output_buffer: ExtrudingG1Buffer,
+        max_iterations_exceeded_count: u64,
+        good_enough_before_max_iterations_count: u64,
+        old_loc: Point,
+        fine_layers: Layers,
+    }
+    impl GcodeLineHandler for DownstreamCoarseHandler {
+        fn handle_g1(&mut self, c: G1LineContext) {
+            if c.g.loc == c.old_loc && !c.opt_extrude.is_some() {
+                let mut new_line = String::new();
+                match c.opt_f {
+                    None => {
+                        write!(&mut new_line, "; same pos, no E, no F, removed: {}", c.line)
+                            .expect("write failed");
+                    }
+                    Some(f) => {
+                        write!(
+                            &mut new_line,
+                            "G1 F{} ; was same pos, no E, squelched: {}",
+                            f, c.line
+                        )
                         .expect("write failed");
-                }
-                Some(f) => {
-                    write!(
-                        &mut new_line,
-                        "G1 F{} ; was same pos, no E, squelched: {}",
-                        f, c.line
-                    )
-                    .expect("write failed");
-                    if let Some(comment) = c.opt_comment {
-                        write!(new_line, " {}", comment).expect("write failed");
+                        if let Some(comment) = c.opt_comment {
+                            write!(new_line, " {}", comment).expect("write failed");
+                        }
                     }
                 }
+                self.output_buffer.queue_line(&new_line);
+                return;
             }
-            output_buffer.queue_line(&new_line);
-            return;
-        }
-        if !c.opt_extrude.is_some() || !c.has_explicit_z {
-            output_buffer.queue_line(c.line);
-            // We don't worry about this point being non-corrected. Technically "wrong" but doesn't
-            // matter enough to worry about.
-            old_loc = c.g.loc;
-            return;
-        }
-        //println!("<<<< {}", c.line);
-        let mut point_so_far: Point = c.g.loc;
-        let mut refinement_step_ordinal = 0;
-        loop {
-            let p1_distance_and_cursor = fine_layers.point_min_distance(&point_so_far, FIRST_Z_MAX_DISTANCE_DEFAULT, None).expect("p1 not found within FIRST_Z_MAX_DISTANCE_DEFAULT; fine slicing and coarse slicing not aligned?");
-
-            // Now we want a p2_distance_and_cursor, that is not in the same layer as
-            // p1_distance_and_cursor. This means we want to filter out the z value of
-            // p1_distance_and_cursor. Unfortunately, the kd_tree doesn't let us keep expanding the
-            // sphere and get points in increasing distance, nor does it let us query for the
-            // nearest point passing a filter. Because we'll be connecting the closest point
-            // p1_distance_and_cursor with the 2nd closest (with different z) point
-            // p2_distance_and_cursor to construct a segment ("construction segment"; not printed),
-            // and then using the point on that line that's closest to the z value of loc, we only
-            // really care about the actual geometry of p2_distance_and_cursor when the z value of
-            // p2_distance_and_cursor is in the opposite z direction from p1_distance_and_cursor,
-            // since if it's in the same z direction, we'll just end up clamping to the
-            // p1_distance_and_cursor end of the constructed segment anyway (we don't extrapolate
-            // beyond the ends of the construction segment since that could cause the output gcode
-            // to move backwards for short distances over already-printed perimeter when crossing a
-            // seam in the layer below).
-            //
-            // By limiting the search for p2_distance_and_cursor to a reasonable distance, and just
-            // using p1_distance_and_cursor if we don't find a p2_distance_and_cursor, we might
-            // handle particularly advanced designed-for-vase-mode isolated
-            // bridge-through-the-air-intentionally paths better, though that's TBV.
-            //
-            // The case we really want to do well is when the z value of loc is between two fine
-            // layers' z values, with the two fine layers each having a nearby point that's roughly
-            // a fractional coarse layer height away from loc in z. At the "fudge line", the xy
-            // distance can be larger.
-            //
-            // The threshold distance is a max distance from loc (not expanded by distance to
-            // p1_distance_and_cursor).
-
-            let exclude_z = p1_distance_and_cursor.layer_cursor.layer.z;
-            let p2_distance_and_cursor = fine_layers.point_min_distance(
-                &point_so_far,
-                OTHER_Z_MAX_DISTANCE_DEFAULT,
-                Some(exclude_z),
-            );
-
-            let best_point_1 = p1_distance_and_cursor.layer_cursor.get_point();
-            let best_point_2 = p2_distance_and_cursor
-                .map(|distance_and_cursor| distance_and_cursor.layer_cursor.get_point());
-
-            let old_point_so_far = point_so_far;
-
-            let loc_z = c.g.loc.z;
-            if best_point_2.is_none() {
-                point_so_far = Point {
-                    x: best_point_1.x,
-                    y: best_point_1.y,
-                    z: loc_z,
-                };
-            } else {
-                let best_point_2 = best_point_2.unwrap();
-                if best_point_1.z == best_point_2.z {
-                    dbg!(best_point_1);
-                    dbg!(best_point_2);
-                }
-                assert!(
-                    best_point_1.z != best_point_2.z,
-                    "{} {}",
-                    best_point_1.z,
-                    best_point_2.z
+            if !c.opt_extrude.is_some() || !c.has_explicit_z {
+                self.output_buffer.queue_line(c.line.as_str());
+                // We don't worry about this point being non-corrected. Technically "wrong" but doesn't
+                // matter enough to worry about.
+                self.old_loc = c.g.loc;
+                return;
+            }
+            //println!("<<<< {}", c.line);
+            let mut point_so_far: Point = c.g.loc;
+            let mut refinement_step_ordinal = 0;
+            loop {
+                let p1_distance_and_cursor = self.fine_layers.point_min_distance(&point_so_far, FIRST_Z_MAX_DISTANCE_DEFAULT, None).expect("p1 not found within FIRST_Z_MAX_DISTANCE_DEFAULT; fine slicing and coarse slicing not aligned?");
+    
+                // Now we want a p2_distance_and_cursor, that is not in the same layer as
+                // p1_distance_and_cursor. This means we want to filter out the z value of
+                // p1_distance_and_cursor. Unfortunately, the kd_tree doesn't let us keep expanding the
+                // sphere and get points in increasing distance, nor does it let us query for the
+                // nearest point passing a filter. Because we'll be connecting the closest point
+                // p1_distance_and_cursor with the 2nd closest (with different z) point
+                // p2_distance_and_cursor to construct a segment ("construction segment"; not printed),
+                // and then using the point on that line that's closest to the z value of loc, we only
+                // really care about the actual geometry of p2_distance_and_cursor when the z value of
+                // p2_distance_and_cursor is in the opposite z direction from p1_distance_and_cursor,
+                // since if it's in the same z direction, we'll just end up clamping to the
+                // p1_distance_and_cursor end of the constructed segment anyway (we don't extrapolate
+                // beyond the ends of the construction segment since that could cause the output gcode
+                // to move backwards for short distances over already-printed perimeter when crossing a
+                // seam in the layer below).
+                //
+                // By limiting the search for p2_distance_and_cursor to a reasonable distance, and just
+                // using p1_distance_and_cursor if we don't find a p2_distance_and_cursor, we might
+                // handle particularly advanced designed-for-vase-mode isolated
+                // bridge-through-the-air-intentionally paths better, though that's TBV.
+                //
+                // The case we really want to do well is when the z value of loc is between two fine
+                // layers' z values, with the two fine layers each having a nearby point that's roughly
+                // a fractional coarse layer height away from loc in z. At the "fudge line", the xy
+                // distance can be larger.
+                //
+                // The threshold distance is a max distance from loc (not expanded by distance to
+                // p1_distance_and_cursor).
+    
+                let exclude_z = p1_distance_and_cursor.layer_cursor.layer.z;
+                let p2_distance_and_cursor = self.fine_layers.point_min_distance(
+                    &point_so_far,
+                    OTHER_Z_MAX_DISTANCE_DEFAULT,
+                    Some(exclude_z),
                 );
-                let low_z_point: Point;
-                let high_z_point: Point;
-                if best_point_1.z > best_point_2.z {
-                    low_z_point = best_point_2;
-                    high_z_point = best_point_1;
-                } else {
-                    low_z_point = best_point_1;
-                    high_z_point = best_point_2;
-                }
-                if point_so_far.z >= high_z_point.z {
+    
+                let best_point_1 = p1_distance_and_cursor.layer_cursor.get_point();
+                let best_point_2 = p2_distance_and_cursor
+                    .map(|distance_and_cursor| distance_and_cursor.layer_cursor.get_point());
+    
+                let old_point_so_far = point_so_far;
+    
+                let loc_z = c.g.loc.z;
+                if best_point_2.is_none() {
                     point_so_far = Point {
-                        x: high_z_point.x,
-                        y: high_z_point.y,
-                        z: loc_z,
-                    };
-                } else if point_so_far.z <= low_z_point.z {
-                    point_so_far = Point {
-                        x: low_z_point.x,
-                        y: low_z_point.y,
+                        x: best_point_1.x,
+                        y: best_point_1.y,
                         z: loc_z,
                     };
                 } else {
-                    let high_z_factor = (loc_z - low_z_point.z) / (high_z_point.z - low_z_point.z);
-                    let high_minus_low = high_z_point - low_z_point;
-                    let tmp_point = low_z_point + high_minus_low * high_z_factor;
-                    // should be very close to equal
-                    assert!((tmp_point.z - loc_z).abs() < 0.01);
-                    point_so_far = Point {
-                        x: tmp_point.x,
-                        y: tmp_point.y,
-                        z: loc_z,
-                    };
+                    let best_point_2 = best_point_2.unwrap();
+                    if best_point_1.z == best_point_2.z {
+                        dbg!(best_point_1);
+                        dbg!(best_point_2);
+                    }
+                    assert!(
+                        best_point_1.z != best_point_2.z,
+                        "{} {}",
+                        best_point_1.z,
+                        best_point_2.z
+                    );
+                    let low_z_point: Point;
+                    let high_z_point: Point;
+                    if best_point_1.z > best_point_2.z {
+                        low_z_point = best_point_2;
+                        high_z_point = best_point_1;
+                    } else {
+                        low_z_point = best_point_1;
+                        high_z_point = best_point_2;
+                    }
+                    if point_so_far.z >= high_z_point.z {
+                        point_so_far = Point {
+                            x: high_z_point.x,
+                            y: high_z_point.y,
+                            z: loc_z,
+                        };
+                    } else if point_so_far.z <= low_z_point.z {
+                        point_so_far = Point {
+                            x: low_z_point.x,
+                            y: low_z_point.y,
+                            z: loc_z,
+                        };
+                    } else {
+                        let high_z_factor = (loc_z - low_z_point.z) / (high_z_point.z - low_z_point.z);
+                        let high_minus_low = high_z_point - low_z_point;
+                        let tmp_point = low_z_point + high_minus_low * high_z_factor;
+                        // should be very close to equal
+                        assert!((tmp_point.z - loc_z).abs() < 0.01);
+                        point_so_far = Point {
+                            x: tmp_point.x,
+                            y: tmp_point.y,
+                            z: loc_z,
+                        };
+                    }
+                }
+    
+                refinement_step_ordinal += 1;
+                if refinement_step_ordinal >= REFINEMENT_MAX_ITERATIONS {
+                    self.max_iterations_exceeded_count += 1;
+                    break;
+                }
+    
+                let update_vec = point_so_far - old_point_so_far;
+                if update_vec.norm() < REFINEMENT_GOOD_ENOUGH_TO_STOP_UPDATE_DISTANCE {
+                    self.good_enough_before_max_iterations_count += 1;
+                    break;
                 }
             }
-
-            refinement_step_ordinal += 1;
-            if refinement_step_ordinal >= REFINEMENT_MAX_ITERATIONS {
-                max_iterations_exceeded_count += 1;
-                break;
-            }
-
-            let update_vec = point_so_far - old_point_so_far;
-            if update_vec.norm() < REFINEMENT_GOOD_ENOUGH_TO_STOP_UPDATE_DISTANCE {
-                good_enough_before_max_iterations_count += 1;
-                break;
-            }
+            let new_point = point_so_far;
+    
+            let old_move_distance = (c.g.loc - c.old_loc).norm();
+            let old_extrude = c.opt_extrude.unwrap();
+            let new_move_distance = (new_point - self.old_loc).norm();
+            let new_extrude = old_extrude * new_move_distance / old_move_distance;
+    
+            //dbg!(old_move_distance);
+            //dbg!(old_extrude);
+            //dbg!(new_move_distance);
+            //dbg!(new_extrude);
+    
+            self.output_buffer.queue_g1(ExtrudingG1 {
+                point: new_point,
+                extrude: new_extrude,
+                opt_f: c.opt_f,
+                opt_comment: c.opt_comment.map(|s| s.into()),
+            });
+    
+            self.old_loc = new_point;
         }
-        let new_point = point_so_far;
 
-        let old_move_distance = (c.g.loc - c.old_loc).norm();
-        let old_extrude = c.opt_extrude.unwrap();
-        let new_move_distance = (new_point - old_loc).norm();
-        let new_extrude = old_extrude * new_move_distance / old_move_distance;
+        fn handle_default(&mut self, s: &str) {
+            self.output_buffer.queue_line(s);
+        }
+    }
 
-        //dbg!(old_move_distance);
-        //dbg!(old_extrude);
-        //dbg!(new_move_distance);
-        //dbg!(new_extrude);
+    let (mut tx_handler, mut rx_buffer) = handler_channel(512);
 
-        output_buffer.queue_g1(ExtrudingG1 {
-            point: new_point,
-            extrude: new_extrude,
-            opt_f: c.opt_f,
-            opt_comment: c.opt_comment.map(|s| s.into()),
-        });
+    thread::spawn(move || {
+        process_lines(coarse_gcode_lines, tx_handler.as_mut());
+    });
 
-        old_loc = new_point;
-    };
+    let mut coarse_handler = DownstreamCoarseHandler{output_buffer: ExtrudingG1Buffer::new(buf_writer), max_iterations_exceeded_count: 0, good_enough_before_max_iterations_count: 0, old_loc: Point::default(), fine_layers};
 
-    let mut default_handler = |s: &str| {
-        output_buffer.borrow_mut().queue_line(s);
-    };
-
-    let mut line_handler = GcodeLineHandler {
-        g1_handler: &mut g1_handler,
-        default_handler: &mut default_handler,
-    };
-
-    process_lines(coarse_gcode_lines, &mut line_handler);
-
-    output_buffer.borrow_mut().flush();
+    rx_buffer.process_lines(&mut coarse_handler);
+    coarse_handler.output_buffer.flush();
 
     println!(
         "max_iterations_exceeded_count: {} good_enough_before_max_iterations_count: {}",
-        max_iterations_exceeded_count, good_enough_before_max_iterations_count
+        coarse_handler.max_iterations_exceeded_count, coarse_handler.good_enough_before_max_iterations_count
     );
 }
 
