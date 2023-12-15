@@ -4,6 +4,7 @@ use ordered_float::OrderedFloat;
 use rand::Rng;
 use regex::Regex;
 use std::cell::{RefCell, RefMut};
+use std::cmp::min;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::f32::consts::PI;
 use std::fmt::Write as fmt_Write;
@@ -92,6 +93,8 @@ pub use f32 as Factor;
 pub use f32 as Radians;
 pub use u32 as PointIndex;
 
+const COARSE_LAYER_HEIGHT: Mm = 0.3;
+
 // We give up if we don't find any fine slicing points within this distance. When this threshold is
 // exceeded, it's likely to mean that the fine slicing and coarse slicing aren't aligned.
 const FIRST_Z_MAX_DISTANCE_DEFAULT: Mm = 3.0;
@@ -99,32 +102,81 @@ const FIRST_Z_MAX_DISTANCE_DEFAULT: Mm = 3.0;
 // auto-detected coarse vase slicing layer height.
 //
 // This needs to be roughly big enough to capture the coarse vase-mode slicing points back onto the
-// fine slicing perimeters, but not so big that we'll think the intro line is part of the model
-// for example. This threshold limit does not apply for the first found closest point, which we'll
-// use without any "other" point if this threshold is exceeded by any other-z point on the fine
-// slicing perimeters. So it's not a disaster for this threshold to be exceeded.
+// fine slicing perimeters, but not so big that we'll think the intro line is part of the model for
+// example. This threshold limit does not apply for the first found closest point, which we'll use
+// without any "other" point if this threshold is exceeded by any other-z point on the fine slicing
+// perimeters. So it's not a disaster for this threshold to be exceeded.
 //
 // This needs to be small enough to permit "detaching" from the other z perimeter if the closest
 // point perimeter is just doing it's own thing that's totally different than any nearby perimeter.
 //
 // The 2.0 is to allow for every-other-perimeter stacking (hypothetical clever model). The SQRT_2
 // is to account for up to 45 degree mis-alignment of the next perimeter up or down when that
-// perimeter is essentially a full layer height away. The 0.3 is roughly the max typical layer
-// height with a 0.4mm nozzle, but really this part should be auto-detected.
-const OTHER_Z_MAX_DISTANCE_DEFAULT: Mm = 2.0 * SQRT_2 * 0.3;
+// perimeter is essentially two full layer heights away (should be plenty). The 0.3 is roughly the
+// max typical layer height with a 0.4mm nozzle, but really this part should be auto-detected from
+// the coarse slicing input file (though that's not trivial since layer height could vary, but
+// hopefully not in the vase mode portion of the coarse slicing).
+const OTHER_Z_MAX_DISTANCE_DEFAULT: Mm = 2.0 * SQRT_2 * COARSE_LAYER_HEIGHT;
 const REFINEMENT_MAX_ITERATIONS: u32 = 12;
 const REFINEMENT_GOOD_ENOUGH_TO_STOP_UPDATE_DISTANCE: Mm = 0.001;
+
+// The acceptable distance away from the closest fine perimeter somewhere along an input coarse
+// segment that jumps from one set of fine z layers to a disjoint set of fine z layers. Beyond this
+// threshold, disjoint sets of z layers will trigger an attempt to splice in a portion of a fine
+// perimeter to avoid the jump.
+//
+// If this is too small, we might splice more than necessary and may spend more time checking for
+// jumps. If this is too large, we'll fail to splice away pointless jumps up to this * 2.
+//
+// We also use this as the threshold for finding a splice end position that's close enough to
+// justify doing the splice (we'll try to get closer, but if we can get at least this close,
+// essentially replacing a deviation away from fine layers by > this much, with deviation away from
+// fine layers with the splice <= this much (when we jump back to coarse from the spliced-in fine
+// perimeter chunk), that's good enough to justify splicing).
+//
+// The length of the shortest pointless single-extrusion bridging that we'll potentially splice
+// away is ~2x this value. The max distance of any jump from fine back to coarse at the end of a
+// splice is 1x this value (else we won't do the splice, and just follow the coarse slicing even if
+// it jumps at the start).
+const HORIZONTAL_SHELF_JUMP_DETECTION_THRESHOLD: Mm = 0.5 * OTHER_Z_MAX_DISTANCE_DEFAULT;
+
+// We're willing to look up to half way around the model for a good-enough splice end that's better
+// than what the horizontal shelf jump that we're trying to avoid.
+const HORIZONTAL_SHELF_SPLICE_MAX_SEARCH_Z_DELTA: Mm = 0.5 * COARSE_LAYER_HEIGHT;
+
+// Once we've found a good-enough splice, we keep looking up to this much further along the coarse
+// perimeter to see if we can find a better end of the splice (instead of just good enough). This
+// doesn't allow exceeding HORIZONTAL_SHELF_SPLICE_MAX_SEARCH_Z_DELTA overall.
+//
+// This basically accounts for approaching the fine slicing perimeter at a shallower-than-90-degree
+// angle, and still wanting to get to a better splice end point despite the shallow approach angle,
+// up to a point. A "2% grade" (rise of 1 for every 50 forward) seems like it's very likely to be
+// far enough to find a much better splice end, unless the model is pretty much desined to be
+// adversarial to gcode-spiralizer, in which case we'll just go with the closest thing we find
+// within this search distance from the found good enough point. If this is too low, that just
+// means we potentially jump unnecessarily at the end of the splice by up to
+// HORIZONTAL_SHELF_JUMP_DETECTION_THRESHOLD, since that's the "good enough" distance at the end of
+// the splice to justify doing the splice (the start of the splice was a jump of at least 2.0 *
+// HORIZONTAL_SHELF_JUMP_DETECTION_THRESHOLD).
+const HORIZONTAL_SHELF_SPLICE_KEEP_LOOKING_AFTER_GOOD_ENOUGH_DISTANCE: Mm = 50.0 * HORIZONTAL_SHELF_JUMP_DETECTION_THRESHOLD;
+
+// If we get this close, we take the splice end at this distance as plenty good; no point in
+// continuing to search, even for the remainder of
+// HORIZONTAL_SHELF_SPLICE_KEEP_LOOKING_AFTER_GOOD_ENOUGH_DISTANCE.
+const HORIZONTAL_SHELF_END_SPLICE_EXCELLENT_DISTANCE: Mm = GCODE_RESOLUTION;
 
 // To have 3 segments to catch zig-zag-zig, or to remove a tiny pointless segment between to other
 // segments (while evaluating the reasonable-ness of doing so), we need 4 points.
 const MAX_G1_BUFFERED: usize = 4;
 
-const ENTIRE_SEGMENT: Mm = Mm::MAX / 2.0;
+const REMAINDER_OF_CURRENT_SEGMENT: Mm = Mm::MAX / 2.0;
 
 // TODO: Get this from std when/if available there, and/or switch to const version of sqrt if/when
 // that's a thing.
 const FRAC_1_SQRT_3: Mm = 0.5773502691896257;
 const SQRT_2: Mm = 1.4142135623730951;
+
+const GCODE_RESOLUTION: Mm = 0.0125;
 
 type KdTree = kiddo::float::kdtree::KdTree<Mm, PointIndex, 3, 32, u32>;
 
@@ -531,6 +583,56 @@ pub struct Layer {
     kd_tree: KdTree,
 }
 
+impl Layer {
+    fn point_min_distance(&self, query: &Point, within_distance: Mm) -> Option<DistanceAndCursor> {
+        let mut checked_segments: HashSet<PointIndex> = HashSet::new();
+        let mut min_distance_so_far = within_distance + 0.01;
+        let mut min_distance_cursor_so_far: Option<LayerCursor> = None;
+        let kd_query_point = &[query.x, query.y, query.z];
+        let max_possible_distance_of_kd_tree_point_of_best_segment: Mm =
+            min_distance_so_far + MAX_SUBSEGMENT_LENGTH + KD_TREE_FUDGE_RADIUS;
+        let squared_euclidean_distance = max_possible_distance_of_kd_tree_point_of_best_segment
+            * max_possible_distance_of_kd_tree_point_of_best_segment;
+        // We'd use within_unsorted_iter(), except that seems to have a stack overflow (only
+        // sometimes), so instead we use within_unsorted().
+        //
+        // TODO: post issue, preferably with repro I guess, like by setting constant rng seed.
+        let neighbours = self
+            .kd_tree
+            .within_unsorted::<SquaredEuclidean>(kd_query_point, squared_euclidean_distance);
+        for neighbour in neighbours {
+            let candidate_segment_start_index = neighbour.item;
+
+            // multiple sub-segments of the same segment can be returned
+            if checked_segments.contains(&candidate_segment_start_index) {
+                // we already checked the actual segment, so we don't need to re-check it having
+                // found it again via a different sub-segment's kd_tree point
+                continue;
+            }
+            checked_segments.insert(candidate_segment_start_index);
+
+            let DistanceAndCursor {
+                distance: candidate_distance,
+                layer_cursor: candidate_cursor,
+            } = self.point_segment_index_min_distance(query, candidate_segment_start_index);
+            if candidate_distance >= min_distance_so_far {
+                continue;
+            }
+
+            min_distance_so_far = candidate_distance;
+            min_distance_cursor_so_far = Some(candidate_cursor);
+        }
+        if min_distance_so_far > within_distance {
+            return None;
+        }
+        assert!(min_distance_cursor_so_far.is_some());
+        Some(DistanceAndCursor {
+            distance: min_distance_so_far,
+            layer_cursor: min_distance_cursor_so_far.expect("bug?"),
+        })
+    }
+}
+
 #[allow(dead_code)]
 struct FindClosestToSegmentResult {
     // The location in the layer which is closest to any part of the query segment.
@@ -571,15 +673,56 @@ fn point_segment_min_distance(
 
 impl Layer {
     // Returns the closest point in the layer to any point on the query segment, and returns how
-    // far along the query segment achieves the minimum distance. The minimum distance.
+    // far along the query segment achieves the minimum distance.
     #[allow(unused)]
     fn find_closest_to_segment(
         &self,
         query_start: &Point,
         query_end: &Point,
         within_distance: Mm,
-    ) -> FindClosestToSegmentResult {
-        todo!();
+    ) -> Option<FindClosestToSegmentResult> {
+        let query_vec = (*query_end - *query_start);
+        let query_vec_norm = query_vec.norm();
+        let query_vec_unit = query_vec / query_vec_norm;
+        let mut distance_along_query_vec = 0.0;
+        let mut considered_segments = HashSet::new();
+        let kd_max_distance = within_distance + 2.0 * MAX_SUBSEGMENT_LENGTH + KD_TREE_FUDGE_RADIUS;
+        let mut min_distance_so_far = within_distance + 0.01;
+        let mut min_distance_so_far_distance_along_coarse: Option<Mm> = None;
+        let mut min_distance_so_far_distance_along_fine: Option<Mm> = None;
+        let mut min_distance_so_far_segment_index: PointIndex = 0;
+        while distance_along_query_vec <= query_vec_norm {
+            let query_point = *query_start + query_vec_unit * distance_along_query_vec;
+            distance_along_query_vec += MAX_SUBSEGMENT_LENGTH;
+            let kd_query_point = &[query_point.x, query_point.y, query_point.z];
+            let kd_max_distance_squared = kd_max_distance * kd_max_distance;
+            let neighbours = self.kd_tree.within_unsorted::<SquaredEuclidean>(kd_query_point, kd_max_distance_squared);
+            for neighbour in neighbours {
+                let fine_segment_index = neighbour.item;
+                
+                if considered_segments.contains(&fine_segment_index) {
+                    continue;
+                }
+                considered_segments.insert(fine_segment_index);
+
+                let fine_segment_start = self.points[fine_segment_index as usize];
+                let fine_segment_end = self.points[(fine_segment_index as usize + 1) % self.points.len()];
+                let closest_points = closest_points_between_segments(query_start, query_end, &fine_segment_start, &fine_segment_end);
+                if closest_points.min_distance < min_distance_so_far {
+                    min_distance_so_far = closest_points.min_distance;
+                    min_distance_so_far_distance_along_coarse = Some(closest_points.along_a_distance);
+                    min_distance_so_far_distance_along_fine = Some(closest_points.along_b_distance);
+                    min_distance_so_far_segment_index = fine_segment_index;
+                }
+            }
+        }
+        if min_distance_so_far > within_distance {
+            return None;
+        }
+        assert!(min_distance_so_far_distance_along_coarse.is_some());
+        assert!(min_distance_so_far_distance_along_fine.is_some());
+
+        Some(FindClosestToSegmentResult{layer_cursor: LayerCursor { layer: self.weak_self.upgrade().unwrap(), segment_start_index: min_distance_so_far_segment_index, distance_along_segment: min_distance_so_far_distance_along_fine.unwrap()}, distance_along_query_segment: min_distance_so_far_distance_along_coarse.unwrap(), separation_distance: min_distance_so_far})
     }
 
     fn point_segment_index_min_distance(
@@ -606,6 +749,10 @@ impl Layer {
 // All the fine slicing layers. The intro line is excluded (detected via negative y).
 #[derive(Debug)]
 pub struct Layers {
+    // TODO: Consider streaming this through using a reader thread and discard of fine layers that
+    // are out of z distance threshold below the coarse z we're working on. For some larger fine
+    // slicings this would reduce memory usage quite a bit.
+    //
     // key: z of the layer; we use Rc because LayerCursor needs to refer to layers also
     layers: BTreeMap<OrderedFloat<Mm>, Rc<RefCell<Layer>>>,
 }
@@ -618,7 +765,6 @@ impl Layers {
         within_distance: Mm,
         exclude_z: Option<Mm>,
     ) -> Option<DistanceAndCursor> {
-        let mut checked_segments: HashSet<PointIndex> = HashSet::new();
         let mut min_distance_so_far = within_distance + 0.01;
         let mut min_distance_cursor_so_far: Option<LayerCursor> = None;
         // Workaround for MergeIter::with_custom_ordering only accepting a function pointer not a closure.
@@ -661,41 +807,17 @@ impl Layers {
             if (layer.z - query.z).abs() > min_distance_so_far {
                 break;
             }
-            checked_segments.clear();
-            let kd_query_point = &[query.x, query.y, query.z];
-            let max_possible_distance_of_kd_tree_point_of_best_segment: Mm =
-                min_distance_so_far + MAX_SUBSEGMENT_LENGTH + KD_TREE_FUDGE_RADIUS;
-            let squared_euclidean_distance = max_possible_distance_of_kd_tree_point_of_best_segment
-                * max_possible_distance_of_kd_tree_point_of_best_segment;
-            // We'd use within_unsorted_iter(), except that seems to have a stack overflow (only
-            // sometimes), so instead we use within_unsorted().
-            //
-            // TODO: post issue, preferably with repro I guess, like by setting constant rng seed.
-            let neighbours = layer
-                .kd_tree
-                .within_unsorted::<SquaredEuclidean>(kd_query_point, squared_euclidean_distance);
-            for neighbour in neighbours {
-                let candidate_segment_start_index = neighbour.item;
-
-                // multiple sub-segments of the same segment can be returned
-                if checked_segments.contains(&candidate_segment_start_index) {
-                    // we already checked the actual segment, so we don't need to re-check it having
-                    // found it again via a different sub-segment's kd_tree point
-                    continue;
-                }
-                checked_segments.insert(candidate_segment_start_index);
-
-                let DistanceAndCursor {
-                    distance: candidate_distance,
-                    layer_cursor: candidate_cursor,
-                } = layer.point_segment_index_min_distance(query, candidate_segment_start_index);
-                if candidate_distance >= min_distance_so_far {
-                    continue;
-                }
-
-                min_distance_so_far = candidate_distance;
-                min_distance_cursor_so_far = Some(candidate_cursor);
+            
+            let maybe_distance_and_cursor = layer.point_min_distance(query, within_distance);
+            if maybe_distance_and_cursor.is_none() {
+                continue;
             }
+            let distance_and_cursor = maybe_distance_and_cursor.unwrap();
+            if distance_and_cursor.distance >= min_distance_so_far {
+                continue;
+            }
+            min_distance_so_far = distance_and_cursor.distance;
+            min_distance_cursor_so_far = Some(distance_and_cursor.layer_cursor);
         }
         if min_distance_so_far > within_distance {
             return None;
@@ -708,7 +830,7 @@ impl Layers {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct LayerCursor {
     layer: Rc<RefCell<Layer>>,
     segment_start_index: PointIndex,
@@ -772,6 +894,7 @@ pub struct G1LineContext {
     opt_extrude: Option<Mm>,
     opt_f: Option<Mm>,
     opt_comment: Option<String>,
+    is_spliced: bool,
 }
 
 pub trait GcodeLineHandler {
@@ -864,6 +987,7 @@ pub fn process_lines(
                 opt_extrude,
                 opt_f,
                 opt_comment,
+                is_spliced: false,
             };
             line_handler.handle_g1(g1_line_context);
             continue;
@@ -1243,14 +1367,30 @@ enum GcodeInputHandlerItem {
     Default(String),
 }
 
+// For peeking ahead, we're only interested in G1s, but we want to retain the other lines as well,
+// with correct ordering, so that we can "splice" by removing and replacing a chunk of G1s without
+// removing any fan or temperature related commands (or anything else that's not a G1). We only
+// ever splice extruding G1s, not non-extruding G1s, so we don't have to worry about non-extruding
+// G1s being removed / replaced.
+#[derive(Clone)]
+struct GcodeInputG1Item {
+    // ordered front to back, before g1
+    default_items_before: VecDeque<String>,
+    // ordered after default_items_before
+    g1: Option<G1LineContext>,
+}
+
 struct RxBuffer {
     rx: Receiver<GcodeInputHandlerItem>,
-    // These can be previously-peeked items and/or replacment items, and will be processed first.
-    first: VecDeque<GcodeInputHandlerItem>,
+    // These can be previously-peeked items and/or replacment items, and will be processed first,
+    // ordered front to back. We try to avoid buffering way more items here than needed, since
+    // that just uses more memory for no good reason.
+    first: VecDeque<GcodeInputG1Item>,
+    weak_self: Weak<RefCell<RxBuffer>>,
 }
 
 impl RxBuffer {
-    fn process_lines(&mut self, line_handler: &mut dyn GcodeLineHandler) {
+    fn process_lines(this: &Rc<RefCell<RxBuffer>>, line_handler: &mut dyn GcodeLineHandler) {
         let mut handle_item = move |item: GcodeInputHandlerItem| match item {
             GcodeInputHandlerItem::G1(g1) => {
                 line_handler.handle_g1(g1);
@@ -1260,26 +1400,170 @@ impl RxBuffer {
             }
         };
         loop {
-            if let Some(item) = self.first.pop_front() {
-                handle_item(item);
+            let maybe_item = this.borrow_mut().first.pop_front();
+            if let Some(mut item) = maybe_item {
+                // We re-wrap in GcodeInputHandlerItem in here mainly for clarity and consistency
+                // of handling; the cost shouldn't be particularly high since this only runs for
+                // items that were peeked or spliced in, which shouldn't happen particularly often.
+                while let Some(default_before) = item.default_items_before.pop_front() {
+                    handle_item(GcodeInputHandlerItem::Default(default_before));
+                }
+                if let Some(g1) = item.g1 {
+                    handle_item(GcodeInputHandlerItem::G1(g1));
+                }
                 continue;
             }
-            match self.rx.recv() {
+            let recvd = this.borrow().rx.recv();
+            match recvd {
                 Ok(item) => {
                     handle_item(item);
                     continue;
                 }
                 Err(_e) => {
-                    assert!(self.first.is_empty());
+                    assert!(this.borrow().first.is_empty());
                     println!("input channel done");
                     return;
                 }
             }
         }
     }
+
+    // We rely on for correctness, but don't enforce, that process_lines is not called while the
+    // cursor is active.
+    fn peek_cursor(&mut self) -> PeekCursor {
+        PeekCursor::new(self.weak_self.upgrade().unwrap())
+    }
 }
 
-fn handler_channel(channel_capacity: usize) -> (Box<dyn GcodeLineHandler + Send>, RxBuffer) {
+#[derive(Clone)]
+struct PeekCursor {
+    rx_buffer: Rc<RefCell<RxBuffer>>,
+    next_index_in_first: usize,
+    current_g1: Option<GcodeInputG1Item>,
+    segment_start: Point,
+    segment_end: Point,
+    segment_vec: Vec3,
+    segment_vec_norm: Mm,
+    sum_segment_vec_norms_before_current: Mm,
+    sum_segment_extrusion_before_current: Mm,
+    distance_along_segment: Mm,
+    hit_eof: bool,
+}
+
+impl PeekCursor {
+    fn new(rx_buffer: Rc<RefCell<RxBuffer>>) -> PeekCursor {
+        PeekCursor{rx_buffer, next_index_in_first: 0, current_g1: None, segment_start: Point::default(), segment_end: Point::default(), segment_vec: Vec3::default(), segment_vec_norm: 0.0, sum_segment_vec_norms_before_current: 0.0, sum_segment_extrusion_before_current: 0.0, distance_along_segment: 0.0, hit_eof: false}
+    }
+
+    // TODO: pick a better name
+    fn get_segment_and_advance(&mut self) -> bool {
+        // segment_vec_norm is initially 0.0
+        self.sum_segment_vec_norms_before_current += self.segment_vec_norm;
+        if let Some(g1_input_item) = &self.current_g1 {
+            self.sum_segment_extrusion_before_current += g1_input_item.g1.as_ref().unwrap().opt_extrude.as_ref().unwrap();
+        }
+        let mut rx_buffer = self.rx_buffer.borrow_mut();
+        if self.next_index_in_first == rx_buffer.first.len() {
+            rx_buffer.first.push_back(GcodeInputG1Item{default_items_before: VecDeque::new(), g1: None});
+            loop {
+                match rx_buffer.rx.recv() {
+                    Ok(item) => {
+                        match item {
+                            GcodeInputHandlerItem::Default(line) => {
+                                let input_g1 = rx_buffer.first.back_mut().unwrap();
+                                input_g1.default_items_before.push_back(line);
+                                continue;
+                            },
+                            GcodeInputHandlerItem::G1(c) => {
+                                if c.g.loc == c.old_loc && !c.opt_extrude.is_some() {
+                                    // TODO: avoid duplicated / super-similar code
+                                    let mut new_line = String::new();
+                                    match c.opt_f {
+                                        None => {
+                                            write!(&mut new_line, "; same pos, no E, no F, removed (sp): {}", c.line)
+                                                .expect("write failed");
+                                        }
+                                        Some(f) => {
+                                            write!(
+                                                &mut new_line,
+                                                "G1 F{} ; was same pos, no E, squelched (sp): {}",
+                                                f, c.line
+                                            )
+                                            .expect("write failed");
+                                            if let Some(comment) = c.opt_comment {
+                                                write!(new_line, " {}", comment).expect("write failed");
+                                            }
+                                        }
+                                    }
+                                    let input_g1 = rx_buffer.first.back_mut().unwrap();
+                                    input_g1.default_items_before.push_back(new_line);
+                                    continue;
+                                }
+                                let input_g1 = rx_buffer.first.back_mut().unwrap();
+                                // TODO: avoid the clone here I guess
+                                input_g1.g1 = Some(c.clone());
+                                if c.opt_extrude.is_none() || !c.has_explicit_z {
+                                    // We never iterate into or past a non-extruding segment (but
+                                    // we do save the non-extruding g1 info into rx_buffer.first
+                                    // since it does need to get processed normally; just not as
+                                    // a PeekCursor g1)
+                                    return false;
+                                }
+                                break;
+                            }
+                        }
+                    },
+                    Err(_e) => {
+                        self.hit_eof = true;
+                        // In this case it's possible the input_g1 has None g1, which is fine for
+                        // the last item in first in the whole file; that item never gets iterated
+                        // over by PeekCursor; PeekCursor clients only want to know about g1(s).
+                        return false;
+                    }
+                }
+            }
+        }
+        assert!(self.next_index_in_first < rx_buffer.first.len());
+        self.current_g1 = Some(rx_buffer.first.get(self.next_index_in_first).unwrap().clone());
+        assert!(self.current_g1.as_ref().unwrap().g1.as_ref().unwrap().opt_extrude.is_some());
+        self.next_index_in_first += 1;
+        let g1_line = self.current_g1.as_ref().unwrap().g1.as_ref().unwrap();
+        self.segment_start = g1_line.old_loc;
+        self.segment_end = g1_line.g.loc;
+        self.segment_vec = self.segment_end - self.segment_start;
+        self.segment_vec_norm = self.segment_vec.norm();
+        self.distance_along_segment = 0.0;
+        true
+    }
+    fn next_advance_by_at_most(&mut self, at_most: Mm) -> bool {
+        if !self.current_g1.is_some() {
+            if !self.get_segment_and_advance() {
+                assert!(self.hit_eof);
+                return false;
+            }
+            // 0.0 along segment 0
+            return true;
+        }
+        assert!(!self.hit_eof);
+        self.distance_along_segment += at_most;
+        if self.distance_along_segment > self.segment_vec_norm {
+            if !self.get_segment_and_advance() {
+                return false;
+            }
+        }
+        // 0.0 along a new segment, or within current segment
+        true
+    }
+    fn get_point(&self) -> Point {
+        assert!(self.current_g1.is_some());
+        self.segment_start + (self.segment_vec / self.segment_vec_norm) * self.distance_along_segment
+    }
+    fn get_distance_since_creation(&self) -> Mm {
+        self.sum_segment_vec_norms_before_current + self.distance_along_segment
+    }
+}
+
+fn handler_channel(channel_capacity: usize) -> (Box<dyn GcodeLineHandler + Send>, Rc<RefCell<RxBuffer>>) {
     struct UpstreamCoarseLineHandler {
         tx: SyncSender<GcodeInputHandlerItem>,
     }
@@ -1300,10 +1584,12 @@ fn handler_channel(channel_capacity: usize) -> (Box<dyn GcodeLineHandler + Send>
 
     let upstream_handler = Box::new(UpstreamCoarseLineHandler { tx });
 
-    let rx_buffer = RxBuffer {
+    let rx_buffer = Rc::new(RefCell::new(RxBuffer {
         rx,
         first: VecDeque::new(),
-    };
+        weak_self: Weak::new(),
+    }));
+    rx_buffer.borrow_mut().weak_self = Rc::downgrade(&rx_buffer);
 
     (upstream_handler, rx_buffer)
 }
@@ -1320,9 +1606,365 @@ fn generate_output(
         old_loc: Point,
         old_p1_cursor: Option<LayerCursor>,
         old_p2_cursor: Option<LayerCursor>,
+        old_input_loc: Option<Point>,
         fine_layers: Layers,
+        rx_buffer: Rc<RefCell<RxBuffer>>,
     }
-    impl<'a> GcodeLineHandler for DownstreamCoarseHandler {
+    impl DownstreamCoarseHandler {
+        fn any_z_in_common(
+            p1_z: Mm,
+            p2_z: Option<Mm>,
+            o_p1_z: Option<Mm>,
+            o_p2_z: Option<Mm>,
+        ) -> bool {
+            let mut new_zs = vec![p1_z];
+            if let Some(p2_z) = p2_z {
+                new_zs.push(p2_z);
+            }
+            if let Some(o_p1_z) = o_p1_z {
+                if new_zs.contains(&o_p1_z) {
+                    return true;
+                }
+                if let Some(o_p2_z) = o_p2_z {
+                    if new_zs.contains(&o_p2_z) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        
+        // All points in the coarse slicing are fairly close to a point on a fine slicing perimeter
+        // (less so for points impacted more by the vase mode fudge line, but still fairly close).
+        //
+        // All reasonable coarse segments stay fairly close to a fine layer perimeter along their
+        // entire length. In contrast, a coarse segment that jumps across a horizontal step between
+        // layers in the fine slicing creates a situation where somewhere along the length of the
+        // coarse segment, the closest point on any fine slicing perimeter is fairly far away. This
+        // represents not just bridging, but pointless bridging where a single extrusion is all
+        // alone jumping onto or off of a horizontal shelf. These segments are considered
+        // unreasonable coarse segments (if this function returns true in addition to checks so far
+        // in the caller).
+        //
+        // The function that converts from 0..1 along the segment to distance to nearest point on
+        // any fine perimeter isn't a particularly convenient function to maximize; there's no
+        // guarantee that the midpoint of the segment will be the farthest from any fine perimeter.
+        // We use the midpoint as an initial guess however. If that's already far enough away from
+        // any fine perimeter to return true, super. If not, we scan the line in small enough steps
+        // that we won't estimate low on the max distance by more than 1/2 the
+        // HORIZONTAL_SHELF_JUMP_DETECTION_THRESHOLD threshold (at least that's the idea).
+        //
+        // Both a and b should be coarse points directly from the coarse slicing.
+        fn segment_gets_far_from_fine(&self, a: Point, b: Point) -> bool {
+            let segment_vec = b - a;
+            let segment_norm = segment_vec.norm();
+            // This assumes that both a and b are quite close to a point on a fine perimeter, which
+            // should be a good assumption as long as fine slicing and coarse slicing were done
+            // per instructions in README.md.
+            if segment_norm < 2.0 * HORIZONTAL_SHELF_JUMP_DETECTION_THRESHOLD {
+                return false;
+            }
+            let first_guess = a + segment_vec * 0.5;
+            if let None = self.fine_layers.point_min_distance(&first_guess, HORIZONTAL_SHELF_JUMP_DETECTION_THRESHOLD, None) {
+                return true;
+            }
+            let iter_direction = segment_vec / segment_norm;
+            let mut iter_distance = 0.0;
+            // Maybe worth checking if this loop is eating a lot of time. Hopefully the current
+            // fuction doesn't get called much to begin with, at least when a model doesn't need
+            // splicing in the first place.
+            while iter_distance < segment_norm {
+                let test_point = a + iter_direction * iter_distance;
+                if let None = self.fine_layers.point_min_distance(&test_point, HORIZONTAL_SHELF_JUMP_DETECTION_THRESHOLD, None) {
+                    return true;
+                }
+                iter_distance += HORIZONTAL_SHELF_JUMP_DETECTION_THRESHOLD / 2.0;
+            }
+            false
+        }
+
+        fn try_splicing(&mut self, start_search_z: Mm) -> bool {
+            let mut fine_cursor = self.old_p1_cursor.as_ref().unwrap().clone();
+            let splice_layer_rc = fine_cursor.layer.clone();
+            let splice_layer = splice_layer_rc.borrow();
+
+            // Maybe should ensure that this maps back to gt old_p1_cursor and gt old_p2_cursor by
+            // advancing more if needed, but for now just advance by a little bit along p1 cursor
+            // and hope it does ok wrt being gt old_p2_cursor also. The symptom of being slightly
+            // wrong here will be quite minor compared to the single-extrusion pointless bridging,
+            // but that's a low bar (ok for first rev though).
+            fine_cursor.advance_by_at_most(GCODE_RESOLUTION);
+
+            let mut first_bad_coarse_point_cursor = self.rx_buffer.borrow_mut().peek_cursor();
+            first_bad_coarse_point_cursor.get_segment_and_advance();
+
+            // Up to this point, we've been assuming that bad_coarse_point is far from
+            // splice_layer; time to check.
+            let first_bad_coarse_point = first_bad_coarse_point_cursor.get_point();
+            if let Some(_) = splice_layer.point_min_distance(&first_bad_coarse_point, 2.0 * HORIZONTAL_SHELF_JUMP_DETECTION_THRESHOLD) {
+                println!("bad_coarse_point was already close to splice_layer; not splicing");
+                return false;
+            }
+
+            let mut best_distance_to_fine_so_far = HORIZONTAL_SHELF_JUMP_DETECTION_THRESHOLD + 0.01;
+            let mut best_fine_cursor_so_far: Option<LayerCursor> = None;
+            let mut best_coarse_cursor_so_far: Option<PeekCursor> = None;
+            let mut distance_along_coarse_when_found_good_enough: Option<Mm> = None;
+            let max_search_z = start_search_z + HORIZONTAL_SHELF_SPLICE_MAX_SEARCH_Z_DELTA;
+            // The searching in this loop obeys the max search thresholds approximately, not
+            // precisely. The small subtraction here prevents find_closest_to_segment from needing
+            // to search again near the end of each SEARCH_GRANULARITY chunk of a long coarse
+            // segment, since find_closest_to_segment iterates forward MAX_SUBSEGMENT_LENGTH at a
+            // time internally. For vase models with very short perimeters, like the narrow part of
+            // a narrow funnel, this value may need to be lower, if that model also has horizontal
+            // step jumps in that area of the model. This value will also effectively become
+            // slightly smaller due to flattening/projecting the z ramped coarse path onto the
+            // plane at start_search_z (the z of the last coarse input point that mapped to an
+            // output point (same z on input and output) prior to points of this (potential)
+            // splice).
+            const SEARCH_GRANULARITY: Mm = 5.0 * MAX_SUBSEGMENT_LENGTH - 0.01;
+
+            // Now we need to look along the coarse segments for a place that's again close enough
+            // to fine_cursor.layer. The coarse segments can be peeked from the RxBuffer.
+            let mut peek_cursor = self.rx_buffer.borrow_mut().peek_cursor();
+            loop {
+                // first call will leave cursor at 0.0 along segment 0
+                if !peek_cursor.next_advance_by_at_most(SEARCH_GRANULARITY) {
+                    // hit EOF; maybe we have a splice end we can use already; break and see
+                    break;
+                }
+
+                let cursor_point = peek_cursor.get_point();
+
+                if let Some(distance_along_coarse_when_found_good_enough) = distance_along_coarse_when_found_good_enough {
+                    if peek_cursor.get_distance_since_creation() > distance_along_coarse_when_found_good_enough + HORIZONTAL_SHELF_SPLICE_KEEP_LOOKING_AFTER_GOOD_ENOUGH_DISTANCE {
+                        break;
+                    }
+                }
+
+                let query_start_with_ramped_z = cursor_point;
+                let remaining_len_in_3d = (peek_cursor.segment_end - query_start_with_ramped_z).norm();
+                let query_len_in_3d: f32 = min(OrderedFloat(SEARCH_GRANULARITY), OrderedFloat(remaining_len_in_3d)).into();
+                let query_end_with_ramped_z = query_start_with_ramped_z + (peek_cursor.segment_vec / peek_cursor.segment_vec_norm) * query_len_in_3d;
+
+                // Potentially we could search the first part of SEARCH_GRANULARITY with z less
+                // than or equal to max_search_z, but doesn't seem worth the extra code, especially
+                // since reducing SEARCH_GRANULARITY is already mentioned as potentially needing to
+                // be smaller for super-short-perimeter models that also have horizontal shelves.
+                if query_end_with_ramped_z.z > max_search_z {
+                    break;
+                }
+
+                let query_start = Point{z: start_search_z, ..query_start_with_ramped_z};
+                let query_end = Point{z: start_search_z, ..query_end_with_ramped_z};
+                let maybe_closest_segment = splice_layer.find_closest_to_segment(&query_start, &query_end, HORIZONTAL_SHELF_JUMP_DETECTION_THRESHOLD);
+                if maybe_closest_segment.is_none() {
+                    continue;
+                }
+                let closest_segment = maybe_closest_segment.unwrap();
+
+                if closest_segment.separation_distance >= best_distance_to_fine_so_far {
+                    continue;
+                }
+
+                let mut found_best_so_far = false;
+                let mut found_excellent = false;
+                if closest_segment.separation_distance <= HORIZONTAL_SHELF_END_SPLICE_EXCELLENT_DISTANCE {
+                    found_best_so_far = true;
+                    found_excellent = true;
+                }
+                if best_distance_to_fine_so_far > HORIZONTAL_SHELF_JUMP_DETECTION_THRESHOLD && closest_segment.separation_distance <= HORIZONTAL_SHELF_JUMP_DETECTION_THRESHOLD {
+                    found_best_so_far = true;
+                    distance_along_coarse_when_found_good_enough = Some(peek_cursor.get_distance_since_creation() + closest_segment.distance_along_query_segment);
+                }
+                if found_best_so_far {
+                    best_distance_to_fine_so_far = closest_segment.separation_distance;
+                    best_fine_cursor_so_far = Some(closest_segment.layer_cursor.clone());
+                    let mut coarse_cursor = peek_cursor.clone();
+                    coarse_cursor.distance_along_segment += closest_segment.distance_along_query_segment;
+                    best_coarse_cursor_so_far = Some(coarse_cursor);
+                }
+
+                if found_excellent {
+                    break;
+                }
+            }
+
+            if best_coarse_cursor_so_far.is_none() {
+                // This can happen if we hit EOF or non-extrusion before finding a good splice or
+                // if we just didn't find a good splice end despite looking ahead the max distance.
+                println!("no good-enough splice found despite disjoint fine z(s); not splicing");
+                return false;
+            }
+
+            // TODO: check here that best_fine_cursor_so_far is "after" fine_cursor, accounting for
+            // wrapping being totally fine. A reasonable-ish way to check is to see if the interval
+            // contains less than half the total distance of the fine perimeter (similar to how
+            // checking for "after" works when working in wrapped unsigned integer space). Models
+            // for which that check wouldn't work "well enough" seem likely to be basically
+            // adversarial. This TODO existing shouldn't cause nozzle crashes, so seems reasonable
+            // enough to see how it goes without the check for now.
+
+            let coarse_extrusion_per_distance = peek_cursor.sum_segment_extrusion_before_current / peek_cursor.sum_segment_vec_norms_before_current;
+            let end_fine_cursor = best_fine_cursor_so_far.unwrap();
+            let end_coarse_cursor = best_coarse_cursor_so_far.unwrap();
+
+            // We fill in the z ramp values and full G1LineContext once we have the fine distance
+            // over which to ramp.
+            //
+            // The self.old_input_loc is the last coarse input point before the spliced/synthesized
+            // points. The current fine_cursor is the first fine point of the splice. The
+            // end_fine_cursor is the last fine point of the splice. A little beyond
+            // end_coarse_cursor is the first coarse point after the splice, but still synthesized.
+            // The next coarse point after a little beyond end_coarse_cursor is the first coarse
+            // input point that's after the splice, but the segment inbound to that point is fixed
+            // up since it comes from the last synthesized point and needs extrusion fixed up. When
+            // done splicing, the synthesized points are in front, followed by the coarse input
+            // point with inbound segment fixed up. After that (in front or via channel) are
+            // unmodified input points. Every synthesized point and the first unmodified coarse
+            // point after the splice with fixed-up inbound segment are marked as part of the
+            // splice for purposes of avoiding re-splicing over already-spliced before.
+            //
+            // This list contains synthesized points only, which means it doesn't include the first
+            // unmodified coarse input point after the splice, despite it having fixed-up inbound
+            // segment.
+            let mut replacement_points: VecDeque<Point> = VecDeque::new();
+
+            assert!(start_search_z == self.old_input_loc.unwrap().z);
+            while fine_cursor.segment_start_index as usize != (end_fine_cursor.segment_start_index as usize + 1) % splice_layer.points.len() {
+                let point = fine_cursor.get_point();
+                replacement_points.push_back(Point{z: start_search_z, ..point});
+                fine_cursor.advance_by_at_most(REMAINDER_OF_CURRENT_SEGMENT);
+            }
+            if end_fine_cursor.distance_along_segment != 0.0 {
+                replacement_points.push_back(Point{z: start_search_z, ..end_fine_cursor.get_point()});
+            }
+            let mut just_beyond_end_coarse_cursor = end_coarse_cursor.clone();
+            // Ideally we'd advance by enough here to get a point that's > the previous point on
+            // all fine layers in common after this point and prev point go through the fixup
+            // algorithm. For now we just advance a little bit and hope we don't get artifacts from
+            // going backwards after fixup algorithm.
+            if !just_beyond_end_coarse_cursor.next_advance_by_at_most(GCODE_RESOLUTION) {
+                return false;
+            }
+            replacement_points.push_back(Point{z: start_search_z, ..just_beyond_end_coarse_cursor.get_point()});
+
+            // ensure "first" has enough items before committing to splicing
+            let mut ensure_first_items = just_beyond_end_coarse_cursor.clone();
+            if !ensure_first_items.get_segment_and_advance() {
+                return false;
+            }
+            drop(ensure_first_items);
+
+            // The next point won't be replaced, so doesn't go in replacment_points, but it will
+            // end up getting its incoming segment fixed up since that segment starts with the last
+            // point we added just above.
+
+            // Grab/rescue all the non-extrusion lines.
+            let mut rescued_lines: VecDeque<String> = VecDeque::new();
+            let mut index_in_first: usize = 0;
+            while index_in_first < just_beyond_end_coarse_cursor.next_index_in_first {
+                rescued_lines.append(&mut self.rx_buffer.borrow_mut().first[index_in_first].default_items_before);
+                index_in_first += 1;
+            }
+
+            self.rx_buffer.borrow_mut().first.drain(..just_beyond_end_coarse_cursor.next_index_in_first);
+            // These are no longer valid since they index into self.rx_buffer.first.
+            drop(just_beyond_end_coarse_cursor);
+            drop(end_coarse_cursor);
+            drop(peek_cursor);
+
+            // initially pointing at first unmodified point beyond splice, which needs its incoming
+            // segment fixed up
+            let mut first_unmodified_cursor = self.rx_buffer.borrow_mut().peek_cursor();
+            if !first_unmodified_cursor.get_segment_and_advance() {
+                panic!("impossible; already forced 'first' to have enough items above");
+            }
+            // first_unmodified_cursor still pointing at first unmodified point beyond splice,
+            // now with info cached in fields of first_unmodified_cursor, so get_point can work
+            //
+            // don't need this to be mutable beyond this point
+            let first_unmodified_cursor = first_unmodified_cursor;
+
+            // Compute xy distance over which to ramp z. The first segment is self.old_input_loc to
+            // replacement_points[0]. The last segment is
+            // replacement_points[replacement_points.len() - 1] to rx_buffer.first[0].
+            let mut total_z_ramp_xy_distance = 0.0;
+            let mut prev_point = self.old_input_loc.unwrap();
+            assert!(start_search_z == self.old_input_loc.unwrap().z);
+            for point in &replacement_points {
+                assert!(prev_point.z == start_search_z);
+                assert!(point.z == start_search_z);
+                total_z_ramp_xy_distance += (*point - prev_point).norm();
+                prev_point = point.clone();
+            }
+            total_z_ramp_xy_distance += (Point{z: start_search_z, ..first_unmodified_cursor.current_g1.unwrap().g1.unwrap().g.loc} - replacement_points[replacement_points.len() - 1]).norm();
+            let total_z_ramp_xy_distance = total_z_ramp_xy_distance;
+
+            // Apply z ramp; AFAIK, this z ramp has the same caveats as typical z ramping slicings
+            // (IIUC) when it comes to dealing with tricky models - in particular, this does
+            // nothing to deal with layer-below z jumps due to completely different longer or
+            // shorter path taken by the layer below, which would of course get complicated for
+            // next layer above this one and so on. If we were going to address that "problem",
+            // we'd need to address it globally, not just here. Such an approach might be more
+            // plausible if implemented directly in the slicer, but it would get substantially
+            // complicated - see README.md for any further thoughts on the overall topic.
+            let mut z_ramp_xy_distance_so_far = 0.0;
+            let mut prev_point_xy = self.old_input_loc.unwrap();
+            let lower_z = prev_point_xy.z;
+            let upper_z = self.rx_buffer.borrow().first[0].g1.as_ref().unwrap().g.loc.z;
+            for point in &mut replacement_points {
+                z_ramp_xy_distance_so_far += (*point - prev_point_xy).norm();
+                prev_point_xy = *point;
+                let z_for_point = lower_z + (upper_z - lower_z) * (z_ramp_xy_distance_so_far / total_z_ramp_xy_distance);
+                *point = Point{z: z_for_point, ..*point};
+            }
+
+            // Now distances between points are all what they'll be in the synthetic input we're
+            // creating. We convert the points into synthetic g1 entries now.
+
+            // we'll keep the synthesized input entries separate from rx_buffer.front at first,
+            // mainly to avoid confusion, since we still have the first unmodified point after the
+            // splice in rx_buffer.front[0], and working forwards is less confusing than working
+            // backwards
+            let mut new_g1s: VecDeque<GcodeInputG1Item> = VecDeque::new();
+
+            let mut prev_point = self.old_input_loc.unwrap();
+            for point in replacement_points {
+                let segment_norm = (point - prev_point).norm();
+                let extrude = coarse_extrusion_per_distance * segment_norm;
+
+                let mut line = String::from("");
+                write!(line, "G1 X{} Y{} Z{} E{} ; splice", point.x, point.y, point.z, extrude).expect("write failed");
+                new_g1s.push_back(GcodeInputG1Item { default_items_before: VecDeque::new(), g1: Some(G1LineContext { line, old_loc: prev_point, g: GcodeState { loc: point, is_abs_xyz: true, is_rel_e: true }, has_explicit_z: true, opt_extrude: Some(extrude), opt_f: None, opt_comment: Some(String::from("; splice")), is_spliced: true }) });
+
+                prev_point = point;
+            }
+
+            // fix up inbound segment for rx_buffer.first[0] (first unmodified coarse point after
+            // slice, but it's incoming segment needs fixup)
+
+            {
+                let mut rx_buffer = self.rx_buffer.borrow_mut();
+                let coarse_after = rx_buffer.first[0].g1.as_mut().unwrap();
+                let prev_point = new_g1s.back().unwrap().g1.as_ref().unwrap().g.loc;
+                let segment_norm = (coarse_after.g.loc - prev_point).norm();
+                let extrusion = coarse_extrusion_per_distance * segment_norm;
+                let new_coarse_after = G1LineContext{old_loc: prev_point, opt_extrude: Some(extrusion), ..coarse_after.clone()};
+                *coarse_after = new_coarse_after;
+            }
+
+            {
+                let mut rx_buffer = self.rx_buffer.borrow_mut();
+                new_g1s.append(&mut rx_buffer.first);
+                rx_buffer.first = new_g1s;
+                rx_buffer.first[0].default_items_before.append(&mut rescued_lines);
+            }
+
+            true
+        }
+    }
+    impl GcodeLineHandler for DownstreamCoarseHandler {
         fn handle_g1(&mut self, c: G1LineContext) {
             if c.g.loc == c.old_loc && !c.opt_extrude.is_some() {
                 let mut new_line = String::new();
@@ -1354,10 +1996,11 @@ fn generate_output(
                 return;
             }
             //println!("<<<< {}", c.line);
-            let mut point_so_far: Point = c.g.loc;
+            let input_loc = c.g.loc;
+            let mut point_so_far: Point = input_loc;
             let mut refinement_step_ordinal = 0;
-            let mut p1_cursor: Option<LayerCursor> = None;
-            let mut p2_cursor: Option<LayerCursor> = None;
+            let mut p1_cursor: Option<LayerCursor>;
+            let mut p2_cursor: Option<LayerCursor>;
             loop {
                 let p1_distance_and_cursor = self.fine_layers.point_min_distance(
                     &point_so_far, FIRST_Z_MAX_DISTANCE_DEFAULT, None)
@@ -1403,6 +2046,9 @@ fn generate_output(
                 let best_point_2 = p2_distance_and_cursor
                     .as_ref()
                     .map(|distance_and_cursor| distance_and_cursor.layer_cursor.get_point());
+
+                p1_cursor = Some(p1_distance_and_cursor.layer_cursor);
+                p2_cursor = p2_distance_and_cursor.map(|it| it.layer_cursor);
 
                 let old_point_so_far = point_so_far;
 
@@ -1472,11 +2118,25 @@ fn generate_output(
                     self.good_enough_before_max_iterations_count += 1;
                     break;
                 }
-
-                p1_cursor = Some(p1_distance_and_cursor.layer_cursor);
-                p2_cursor = p2_distance_and_cursor.map(|it| it.layer_cursor);
             }
             let new_point = point_so_far;
+
+            if !c.is_spliced && self.old_input_loc.is_some() && !Self::any_z_in_common(
+                p1_cursor.as_ref().unwrap().layer.borrow().z,
+                p2_cursor.as_ref().map(|c| c.layer.borrow().z),
+                self.old_p1_cursor.as_ref().map(|c| c.layer.borrow().z),
+                self.old_p2_cursor.as_ref().map(|c| c.layer.borrow().z),
+            ) && self.segment_gets_far_from_fine(self.old_input_loc.unwrap(), input_loc) {
+                if self.try_splicing(self.old_loc.z) {
+                    // We spliced some of a fine perimeter into the pending input, in place of a
+                    // problematic (horizontal step skip) portion of the coarse slicing. So we need
+                    // to return to the caller so it can essentially retry with the bad coarse
+                    // point (and some coarse points contiguously after that) replaced with a
+                    // splice derived from fine layers. The spliced points are marked as spliced so
+                    // we won't re-splice and potentially get stuck in an infinite loop.
+                    return;
+                }
+            }
 
             let old_move_distance = (c.g.loc - c.old_loc).norm();
             let old_extrude = c.opt_extrude.unwrap();
@@ -1498,6 +2158,7 @@ fn generate_output(
             self.old_loc = new_point;
             self.old_p1_cursor = p1_cursor;
             self.old_p2_cursor = p2_cursor;
+            self.old_input_loc = Some(input_loc);
         }
 
         fn handle_default(&mut self, s: &str) {
@@ -1505,7 +2166,7 @@ fn generate_output(
         }
     }
 
-    let (mut tx_handler, mut rx_buffer) = handler_channel(512);
+    let (mut tx_handler, rx_buffer) = handler_channel(512);
 
     let coarse_reader_thread = thread::spawn(move || {
         process_lines(coarse_gcode_lines, tx_handler.as_mut());
@@ -1519,10 +2180,12 @@ fn generate_output(
         old_loc: Point::default(),
         old_p1_cursor: None,
         old_p2_cursor: None,
+        old_input_loc: None,
         fine_layers,
+        rx_buffer: rx_buffer.clone(),
     };
 
-    rx_buffer.process_lines(&mut coarse_handler);
+    RxBuffer::process_lines(&rx_buffer, &mut coarse_handler);
     coarse_handler.output_buffer.flush();
 
     coarse_reader_thread.join().expect("join failed");
