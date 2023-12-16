@@ -27,6 +27,9 @@ CAUTION CAUTION CAUTION
 Eliminate the vase mode "seam" that results when slicing in vase mode in
 prusaslicer.
 
+Avoid the spiral jumping onto or off of "horizontal steps" that intentionally
+exist in some models.
+
 See the "Detailed Goal / Purpose" section below if you like reading debian
 governance docs cover to cover.
 
