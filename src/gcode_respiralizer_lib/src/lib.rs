@@ -158,7 +158,8 @@ const HORIZONTAL_SHELF_SPLICE_MAX_SEARCH_Z_DELTA: Mm = 0.5 * COARSE_LAYER_HEIGHT
 // HORIZONTAL_SHELF_JUMP_DETECTION_THRESHOLD, since that's the "good enough" distance at the end of
 // the splice to justify doing the splice (the start of the splice was a jump of at least 2.0 *
 // HORIZONTAL_SHELF_JUMP_DETECTION_THRESHOLD).
-const HORIZONTAL_SHELF_SPLICE_KEEP_LOOKING_AFTER_GOOD_ENOUGH_DISTANCE: Mm = 50.0 * HORIZONTAL_SHELF_JUMP_DETECTION_THRESHOLD;
+const HORIZONTAL_SHELF_SPLICE_KEEP_LOOKING_AFTER_GOOD_ENOUGH_DISTANCE: Mm =
+    50.0 * HORIZONTAL_SHELF_JUMP_DETECTION_THRESHOLD;
 
 // If we get this close, we take the splice end at this distance as plenty good; no point in
 // continuing to search, even for the remainder of
@@ -703,21 +704,30 @@ impl Layer {
             distance_along_query_vec += MAX_SUBSEGMENT_LENGTH;
             let kd_query_point = &[query_point.x, query_point.y, query_point.z];
             let kd_max_distance_squared = kd_max_distance * kd_max_distance;
-            let neighbours = self.kd_tree.within_unsorted::<SquaredEuclidean>(kd_query_point, kd_max_distance_squared);
+            let neighbours = self
+                .kd_tree
+                .within_unsorted::<SquaredEuclidean>(kd_query_point, kd_max_distance_squared);
             for neighbour in neighbours {
                 let fine_segment_index = neighbour.item;
-                
+
                 if considered_segments.contains(&fine_segment_index) {
                     continue;
                 }
                 considered_segments.insert(fine_segment_index);
 
                 let fine_segment_start = self.points[fine_segment_index as usize];
-                let fine_segment_end = self.points[(fine_segment_index as usize + 1) % self.points.len()];
-                let closest_points = closest_points_between_segments(query_start, query_end, &fine_segment_start, &fine_segment_end);
+                let fine_segment_end =
+                    self.points[(fine_segment_index as usize + 1) % self.points.len()];
+                let closest_points = closest_points_between_segments(
+                    query_start,
+                    query_end,
+                    &fine_segment_start,
+                    &fine_segment_end,
+                );
                 if closest_points.min_distance < min_distance_so_far {
                     min_distance_so_far = closest_points.min_distance;
-                    min_distance_so_far_distance_along_coarse = Some(closest_points.along_a_distance);
+                    min_distance_so_far_distance_along_coarse =
+                        Some(closest_points.along_a_distance);
                     min_distance_so_far_distance_along_fine = Some(closest_points.along_b_distance);
                     min_distance_so_far_segment_index = fine_segment_index;
                 }
@@ -729,7 +739,15 @@ impl Layer {
         assert!(min_distance_so_far_distance_along_coarse.is_some());
         assert!(min_distance_so_far_distance_along_fine.is_some());
 
-        Some(FindClosestToSegmentResult{layer_cursor: LayerCursor { layer: self.weak_self.upgrade().unwrap(), segment_start_index: min_distance_so_far_segment_index, distance_along_segment: min_distance_so_far_distance_along_fine.unwrap()}, distance_along_query_segment: min_distance_so_far_distance_along_coarse.unwrap(), separation_distance: min_distance_so_far})
+        Some(FindClosestToSegmentResult {
+            layer_cursor: LayerCursor {
+                layer: self.weak_self.upgrade().unwrap(),
+                segment_start_index: min_distance_so_far_segment_index,
+                distance_along_segment: min_distance_so_far_distance_along_fine.unwrap(),
+            },
+            distance_along_query_segment: min_distance_so_far_distance_along_coarse.unwrap(),
+            separation_distance: min_distance_so_far,
+        })
     }
 
     fn point_segment_index_min_distance(
@@ -814,7 +832,7 @@ impl Layers {
             if (layer.z - query.z).abs() > min_distance_so_far {
                 break;
             }
-            
+
             let maybe_distance_and_cursor = layer.point_min_distance(query, within_distance);
             if maybe_distance_and_cursor.is_none() {
                 continue;
@@ -873,7 +891,10 @@ impl LayerCursor {
         let segment_end = layer.points[segment_end_index as usize];
         let segment_length = (segment_end - segment_start).norm();
         if self.distance_along_segment > segment_length {
-            self.segment_start_index = ((self.segment_start_index as usize + 1) % layer.points.len()).try_into().unwrap();
+            self.segment_start_index = ((self.segment_start_index as usize + 1)
+                % layer.points.len())
+            .try_into()
+            .unwrap();
             // Since we don't ever want to skip an entire segment, we may as well start at 0.0
             // along the new segment.
             self.distance_along_segment = 0.0;
@@ -888,8 +909,12 @@ impl LayerCursor {
         // This isn't unsafe since we're not doing anything unsafe with the pointer value(s).
         assert!(self.layer.as_ptr() == other.layer.as_ptr());
         let layer = self.layer.borrow();
-        let mut self_cumulative_distance = layer.cumulative_distance_up_to[self.segment_start_index as usize] + self.distance_along_segment;
-        let mut other_cumulative_distance = layer.cumulative_distance_up_to[other.segment_start_index as usize] + other.distance_along_segment;
+        let mut self_cumulative_distance = layer.cumulative_distance_up_to
+            [self.segment_start_index as usize]
+            + self.distance_along_segment;
+        let mut other_cumulative_distance = layer.cumulative_distance_up_to
+            [other.segment_start_index as usize]
+            + other.distance_along_segment;
         let half_total_length = 0.5 * layer.total_length;
         //dbg!(layer.total_length);
         //dbg!(self_cumulative_distance);
@@ -897,7 +922,10 @@ impl LayerCursor {
         assert!(self_cumulative_distance < layer.total_length + 0.001);
         assert!(other_cumulative_distance < layer.total_length + 0.001);
         if self_cumulative_distance == other_cumulative_distance {
-            return CmpInternalResult{ ordering: Ordering::Equal, distance_to: 0.0 };
+            return CmpInternalResult {
+                ordering: Ordering::Equal,
+                distance_to: 0.0,
+            };
         }
         let mut self_minus_other = self_cumulative_distance - other_cumulative_distance;
         if self_minus_other.abs() > half_total_length {
@@ -909,9 +937,15 @@ impl LayerCursor {
             self_minus_other = self_cumulative_distance - other_cumulative_distance;
         }
         if self_minus_other > 0.0 {
-            return CmpInternalResult{ ordering: Ordering::Greater, distance_to: -self_minus_other };
+            return CmpInternalResult {
+                ordering: Ordering::Greater,
+                distance_to: -self_minus_other,
+            };
         } else {
-            return CmpInternalResult{ ordering: Ordering::Less, distance_to: -self_minus_other };
+            return CmpInternalResult {
+                ordering: Ordering::Less,
+                distance_to: -self_minus_other,
+            };
         }
     }
 
@@ -1122,8 +1156,12 @@ pub fn read_fine_layers(gcode_lines: io::Lines<io::BufReader<std::fs::File>>) ->
             layer.points.push(c.g.loc.clone());
 
             let distance_so_far = *layer.cumulative_distance_up_to.last().unwrap();
-            let distance_to_add = (layer.points[layer.points.len() - 1] - layer.points[layer.points.len() - 2]).norm();
-            layer.cumulative_distance_up_to.push(distance_so_far + distance_to_add);
+            let distance_to_add = (layer.points[layer.points.len() - 1]
+                - layer.points[layer.points.len() - 2])
+                .norm();
+            layer
+                .cumulative_distance_up_to
+                .push(distance_so_far + distance_to_add);
             layer.total_length += distance_to_add;
 
             // We ensure that each point on the segment is within MAX_SUBSEGMENT_LENGTH plus
@@ -1526,7 +1564,19 @@ struct PeekCursor {
 
 impl PeekCursor {
     fn new(rx_buffer: Rc<RefCell<RxBuffer>>) -> PeekCursor {
-        PeekCursor{rx_buffer, next_index_in_first: 0, current_g1: None, segment_start: Point::default(), segment_end: Point::default(), segment_vec: Vec3::default(), segment_vec_norm: 0.0, sum_segment_vec_norms_before_current: 0.0, sum_segment_extrusion_before_current: 0.0, distance_along_segment: 0.0, hit_eof: false}
+        PeekCursor {
+            rx_buffer,
+            next_index_in_first: 0,
+            current_g1: None,
+            segment_start: Point::default(),
+            segment_end: Point::default(),
+            segment_vec: Vec3::default(),
+            segment_vec_norm: 0.0,
+            sum_segment_vec_norms_before_current: 0.0,
+            sum_segment_extrusion_before_current: 0.0,
+            distance_along_segment: 0.0,
+            hit_eof: false,
+        }
     }
 
     // TODO: pick a better name
@@ -1534,11 +1584,20 @@ impl PeekCursor {
         // segment_vec_norm is initially 0.0
         self.sum_segment_vec_norms_before_current += self.segment_vec_norm;
         if let Some(g1_input_item) = &self.current_g1 {
-            self.sum_segment_extrusion_before_current += g1_input_item.g1.as_ref().unwrap().opt_extrude.as_ref().unwrap();
+            self.sum_segment_extrusion_before_current += g1_input_item
+                .g1
+                .as_ref()
+                .unwrap()
+                .opt_extrude
+                .as_ref()
+                .unwrap();
         }
         let mut rx_buffer = self.rx_buffer.borrow_mut();
         if self.next_index_in_first == rx_buffer.first.len() {
-            rx_buffer.first.push_back(GcodeInputG1Item{default_items_before: VecDeque::new(), g1: None});
+            rx_buffer.first.push_back(GcodeInputG1Item {
+                default_items_before: VecDeque::new(),
+                g1: None,
+            });
             loop {
                 match rx_buffer.rx.recv() {
                     Ok(item) => {
@@ -1547,15 +1606,19 @@ impl PeekCursor {
                                 let input_g1 = rx_buffer.first.back_mut().unwrap();
                                 input_g1.default_items_before.push_back(line);
                                 continue;
-                            },
+                            }
                             GcodeInputHandlerItem::G1(c) => {
                                 if c.g.loc == c.old_loc && !c.opt_extrude.is_some() {
                                     // TODO: avoid duplicated / super-similar code
                                     let mut new_line = String::new();
                                     match c.opt_f {
                                         None => {
-                                            write!(&mut new_line, "; same pos, no E, no F, removed (sp): {}", c.line)
-                                                .expect("write failed");
+                                            write!(
+                                                &mut new_line,
+                                                "; same pos, no E, no F, removed (sp): {}",
+                                                c.line
+                                            )
+                                            .expect("write failed");
                                         }
                                         Some(f) => {
                                             write!(
@@ -1565,7 +1628,8 @@ impl PeekCursor {
                                             )
                                             .expect("write failed");
                                             if let Some(comment) = c.opt_comment {
-                                                write!(new_line, " {}", comment).expect("write failed");
+                                                write!(new_line, " {}", comment)
+                                                    .expect("write failed");
                                             }
                                         }
                                     }
@@ -1586,7 +1650,7 @@ impl PeekCursor {
                                 break;
                             }
                         }
-                    },
+                    }
                     Err(_e) => {
                         self.hit_eof = true;
                         // In this case it's possible the input_g1 has None g1, which is fine for
@@ -1598,8 +1662,22 @@ impl PeekCursor {
             }
         }
         assert!(self.next_index_in_first < rx_buffer.first.len());
-        self.current_g1 = Some(rx_buffer.first.get(self.next_index_in_first).unwrap().clone());
-        assert!(self.current_g1.as_ref().unwrap().g1.as_ref().unwrap().opt_extrude.is_some());
+        self.current_g1 = Some(
+            rx_buffer
+                .first
+                .get(self.next_index_in_first)
+                .unwrap()
+                .clone(),
+        );
+        assert!(self
+            .current_g1
+            .as_ref()
+            .unwrap()
+            .g1
+            .as_ref()
+            .unwrap()
+            .opt_extrude
+            .is_some());
         self.next_index_in_first += 1;
         let g1_line = self.current_g1.as_ref().unwrap().g1.as_ref().unwrap();
         self.segment_start = g1_line.old_loc;
@@ -1630,14 +1708,17 @@ impl PeekCursor {
     }
     fn get_point(&self) -> Point {
         assert!(self.current_g1.is_some());
-        self.segment_start + (self.segment_vec / self.segment_vec_norm) * self.distance_along_segment
+        self.segment_start
+            + (self.segment_vec / self.segment_vec_norm) * self.distance_along_segment
     }
     fn get_distance_since_creation(&self) -> Mm {
         self.sum_segment_vec_norms_before_current + self.distance_along_segment
     }
 }
 
-fn handler_channel(channel_capacity: usize) -> (Box<dyn GcodeLineHandler + Send>, Rc<RefCell<RxBuffer>>) {
+fn handler_channel(
+    channel_capacity: usize,
+) -> (Box<dyn GcodeLineHandler + Send>, Rc<RefCell<RxBuffer>>) {
     struct UpstreamCoarseLineHandler {
         tx: SyncSender<GcodeInputHandlerItem>,
     }
@@ -1712,7 +1793,7 @@ fn generate_output(
             }
             false
         }
-        
+
         // All points in the coarse slicing are fairly close to a point on a fine slicing perimeter
         // (less so for points impacted more by the vase mode fudge line, but still fairly close).
         //
@@ -1744,7 +1825,11 @@ fn generate_output(
                 return false;
             }
             let first_guess = a + segment_vec * 0.5;
-            if let None = self.fine_layers.point_min_distance(&first_guess, HORIZONTAL_SHELF_JUMP_DETECTION_THRESHOLD, None) {
+            if let None = self.fine_layers.point_min_distance(
+                &first_guess,
+                HORIZONTAL_SHELF_JUMP_DETECTION_THRESHOLD,
+                None,
+            ) {
                 return true;
             }
             let iter_direction = segment_vec / segment_norm;
@@ -1754,7 +1839,11 @@ fn generate_output(
             // splicing in the first place.
             while iter_distance < segment_norm {
                 let test_point = a + iter_direction * iter_distance;
-                if let None = self.fine_layers.point_min_distance(&test_point, HORIZONTAL_SHELF_JUMP_DETECTION_THRESHOLD, None) {
+                if let None = self.fine_layers.point_min_distance(
+                    &test_point,
+                    HORIZONTAL_SHELF_JUMP_DETECTION_THRESHOLD,
+                    None,
+                ) {
                     return true;
                 }
                 iter_distance += HORIZONTAL_SHELF_JUMP_DETECTION_THRESHOLD / 2.0;
@@ -1780,7 +1869,10 @@ fn generate_output(
             // Up to this point, we've been assuming that bad_coarse_point is far from
             // splice_layer; time to check.
             let first_bad_coarse_point = first_bad_coarse_point_cursor.get_point();
-            if let Some(_) = splice_layer.point_min_distance(&first_bad_coarse_point, 2.0 * HORIZONTAL_SHELF_JUMP_DETECTION_THRESHOLD) {
+            if let Some(_) = splice_layer.point_min_distance(
+                &first_bad_coarse_point,
+                2.0 * HORIZONTAL_SHELF_JUMP_DETECTION_THRESHOLD,
+            ) {
                 println!("bad_coarse_point was already close to splice_layer; not splicing");
                 return false;
             }
@@ -1815,16 +1907,27 @@ fn generate_output(
 
                 let cursor_point = peek_cursor.get_point();
 
-                if let Some(distance_along_coarse_when_found_good_enough) = distance_along_coarse_when_found_good_enough {
-                    if peek_cursor.get_distance_since_creation() > distance_along_coarse_when_found_good_enough + HORIZONTAL_SHELF_SPLICE_KEEP_LOOKING_AFTER_GOOD_ENOUGH_DISTANCE {
+                if let Some(distance_along_coarse_when_found_good_enough) =
+                    distance_along_coarse_when_found_good_enough
+                {
+                    if peek_cursor.get_distance_since_creation()
+                        > distance_along_coarse_when_found_good_enough
+                            + HORIZONTAL_SHELF_SPLICE_KEEP_LOOKING_AFTER_GOOD_ENOUGH_DISTANCE
+                    {
                         break;
                     }
                 }
 
                 let query_start_with_ramped_z = cursor_point;
-                let remaining_len_in_3d = (peek_cursor.segment_end - query_start_with_ramped_z).norm();
-                let query_len_in_3d: f32 = min(OrderedFloat(SEARCH_GRANULARITY), OrderedFloat(remaining_len_in_3d)).into();
-                let query_end_with_ramped_z = query_start_with_ramped_z + (peek_cursor.segment_vec / peek_cursor.segment_vec_norm) * query_len_in_3d;
+                let remaining_len_in_3d =
+                    (peek_cursor.segment_end - query_start_with_ramped_z).norm();
+                let query_len_in_3d: f32 = min(
+                    OrderedFloat(SEARCH_GRANULARITY),
+                    OrderedFloat(remaining_len_in_3d),
+                )
+                .into();
+                let query_end_with_ramped_z = query_start_with_ramped_z
+                    + (peek_cursor.segment_vec / peek_cursor.segment_vec_norm) * query_len_in_3d;
 
                 // Potentially we could search the first part of SEARCH_GRANULARITY with z less
                 // than or equal to max_search_z, but doesn't seem worth the extra code, especially
@@ -1834,9 +1937,19 @@ fn generate_output(
                     break;
                 }
 
-                let query_start = Point{z: start_search_z, ..query_start_with_ramped_z};
-                let query_end = Point{z: start_search_z, ..query_end_with_ramped_z};
-                let maybe_closest_segment = splice_layer.find_closest_to_segment(&query_start, &query_end, HORIZONTAL_SHELF_JUMP_DETECTION_THRESHOLD);
+                let query_start = Point {
+                    z: start_search_z,
+                    ..query_start_with_ramped_z
+                };
+                let query_end = Point {
+                    z: start_search_z,
+                    ..query_end_with_ramped_z
+                };
+                let maybe_closest_segment = splice_layer.find_closest_to_segment(
+                    &query_start,
+                    &query_end,
+                    HORIZONTAL_SHELF_JUMP_DETECTION_THRESHOLD,
+                );
                 if maybe_closest_segment.is_none() {
                     continue;
                 }
@@ -1848,19 +1961,28 @@ fn generate_output(
 
                 let mut found_best_so_far = false;
                 let mut found_excellent = false;
-                if closest_segment.separation_distance <= HORIZONTAL_SHELF_END_SPLICE_EXCELLENT_DISTANCE {
+                if closest_segment.separation_distance
+                    <= HORIZONTAL_SHELF_END_SPLICE_EXCELLENT_DISTANCE
+                {
                     found_best_so_far = true;
                     found_excellent = true;
                 }
-                if best_distance_to_fine_so_far > HORIZONTAL_SHELF_JUMP_DETECTION_THRESHOLD && closest_segment.separation_distance <= HORIZONTAL_SHELF_JUMP_DETECTION_THRESHOLD {
+                if best_distance_to_fine_so_far > HORIZONTAL_SHELF_JUMP_DETECTION_THRESHOLD
+                    && closest_segment.separation_distance
+                        <= HORIZONTAL_SHELF_JUMP_DETECTION_THRESHOLD
+                {
                     found_best_so_far = true;
-                    distance_along_coarse_when_found_good_enough = Some(peek_cursor.get_distance_since_creation() + closest_segment.distance_along_query_segment);
+                    distance_along_coarse_when_found_good_enough = Some(
+                        peek_cursor.get_distance_since_creation()
+                            + closest_segment.distance_along_query_segment,
+                    );
                 }
                 if found_best_so_far {
                     best_distance_to_fine_so_far = closest_segment.separation_distance;
                     best_fine_cursor_so_far = Some(closest_segment.layer_cursor.clone());
                     let mut coarse_cursor = peek_cursor.clone();
-                    coarse_cursor.distance_along_segment += closest_segment.distance_along_query_segment;
+                    coarse_cursor.distance_along_segment +=
+                        closest_segment.distance_along_query_segment;
                     best_coarse_cursor_so_far = Some(coarse_cursor);
                 }
 
@@ -1884,7 +2006,8 @@ fn generate_output(
             // adversarial. This TODO existing shouldn't cause nozzle crashes, so seems reasonable
             // enough to see how it goes without the check for now.
 
-            let coarse_extrusion_per_distance = peek_cursor.sum_segment_extrusion_before_current / peek_cursor.sum_segment_vec_norms_before_current;
+            let coarse_extrusion_per_distance = peek_cursor.sum_segment_extrusion_before_current
+                / peek_cursor.sum_segment_vec_norms_before_current;
             let end_fine_cursor = best_fine_cursor_so_far.unwrap();
             let end_coarse_cursor = best_coarse_cursor_so_far.unwrap();
 
@@ -1910,13 +2033,21 @@ fn generate_output(
             let mut replacement_points: VecDeque<Point> = VecDeque::new();
 
             assert!(start_search_z == self.old_input_loc.unwrap().z);
-            while fine_cursor.segment_start_index as usize != (end_fine_cursor.segment_start_index as usize + 1) % splice_layer.points.len() {
+            while fine_cursor.segment_start_index as usize
+                != (end_fine_cursor.segment_start_index as usize + 1) % splice_layer.points.len()
+            {
                 let point = fine_cursor.get_point();
-                replacement_points.push_back(Point{z: start_search_z, ..point});
+                replacement_points.push_back(Point {
+                    z: start_search_z,
+                    ..point
+                });
                 fine_cursor.advance_by_at_most(REMAINDER_OF_CURRENT_SEGMENT);
             }
             if end_fine_cursor.distance_along_segment != 0.0 {
-                replacement_points.push_back(Point{z: start_search_z, ..end_fine_cursor.get_point()});
+                replacement_points.push_back(Point {
+                    z: start_search_z,
+                    ..end_fine_cursor.get_point()
+                });
             }
             let mut just_beyond_end_coarse_cursor = end_coarse_cursor.clone();
             // Ideally we'd advance by enough here to get a point that's > the previous point on
@@ -1926,7 +2057,10 @@ fn generate_output(
             if !just_beyond_end_coarse_cursor.next_advance_by_at_most(GCODE_RESOLUTION) {
                 return false;
             }
-            replacement_points.push_back(Point{z: start_search_z, ..just_beyond_end_coarse_cursor.get_point()});
+            replacement_points.push_back(Point {
+                z: start_search_z,
+                ..just_beyond_end_coarse_cursor.get_point()
+            });
 
             // ensure "first" has enough items before committing to splicing
             let mut ensure_first_items = just_beyond_end_coarse_cursor.clone();
@@ -1943,11 +2077,16 @@ fn generate_output(
             let mut rescued_lines: VecDeque<String> = VecDeque::new();
             let mut index_in_first: usize = 0;
             while index_in_first < just_beyond_end_coarse_cursor.next_index_in_first {
-                rescued_lines.append(&mut self.rx_buffer.borrow_mut().first[index_in_first].default_items_before);
+                rescued_lines.append(
+                    &mut self.rx_buffer.borrow_mut().first[index_in_first].default_items_before,
+                );
                 index_in_first += 1;
             }
 
-            self.rx_buffer.borrow_mut().first.drain(..just_beyond_end_coarse_cursor.next_index_in_first);
+            self.rx_buffer
+                .borrow_mut()
+                .first
+                .drain(..just_beyond_end_coarse_cursor.next_index_in_first);
             // These are no longer valid since they index into self.rx_buffer.first.
             drop(just_beyond_end_coarse_cursor);
             drop(end_coarse_cursor);
@@ -1977,7 +2116,17 @@ fn generate_output(
                 total_z_ramp_xy_distance += (*point - prev_point).norm();
                 prev_point = point.clone();
             }
-            total_z_ramp_xy_distance += (Point{z: start_search_z, ..first_unmodified_cursor.current_g1.unwrap().g1.unwrap().g.loc} - replacement_points[replacement_points.len() - 1]).norm();
+            total_z_ramp_xy_distance += (Point {
+                z: start_search_z,
+                ..first_unmodified_cursor
+                    .current_g1
+                    .unwrap()
+                    .g1
+                    .unwrap()
+                    .g
+                    .loc
+            } - replacement_points[replacement_points.len() - 1])
+                .norm();
             let total_z_ramp_xy_distance = total_z_ramp_xy_distance;
 
             // Apply z ramp; AFAIK, this z ramp has the same caveats as typical z ramping slicings
@@ -1991,12 +2140,22 @@ fn generate_output(
             let mut z_ramp_xy_distance_so_far = 0.0;
             let mut prev_point_xy = self.old_input_loc.unwrap();
             let lower_z = prev_point_xy.z;
-            let upper_z = self.rx_buffer.borrow().first[0].g1.as_ref().unwrap().g.loc.z;
+            let upper_z = self.rx_buffer.borrow().first[0]
+                .g1
+                .as_ref()
+                .unwrap()
+                .g
+                .loc
+                .z;
             for point in &mut replacement_points {
                 z_ramp_xy_distance_so_far += (*point - prev_point_xy).norm();
                 prev_point_xy = *point;
-                let z_for_point = lower_z + (upper_z - lower_z) * (z_ramp_xy_distance_so_far / total_z_ramp_xy_distance);
-                *point = Point{z: z_for_point, ..*point};
+                let z_for_point = lower_z
+                    + (upper_z - lower_z) * (z_ramp_xy_distance_so_far / total_z_ramp_xy_distance);
+                *point = Point {
+                    z: z_for_point,
+                    ..*point
+                };
             }
 
             // Now distances between points are all what they'll be in the synthetic input we're
@@ -2014,8 +2173,29 @@ fn generate_output(
                 let extrude = coarse_extrusion_per_distance * segment_norm;
 
                 let mut line = String::from("");
-                write!(line, "G1 X{} Y{} Z{} E{} ; splice", point.x, point.y, point.z, extrude).expect("write failed");
-                new_g1s.push_back(GcodeInputG1Item { default_items_before: VecDeque::new(), g1: Some(G1LineContext { line, old_loc: prev_point, g: GcodeState { loc: point, is_abs_xyz: true, is_rel_e: true }, has_explicit_z: true, opt_extrude: Some(extrude), opt_f: None, opt_comment: Some(String::from("; splice")), is_spliced: true }) });
+                write!(
+                    line,
+                    "G1 X{} Y{} Z{} E{} ; splice",
+                    point.x, point.y, point.z, extrude
+                )
+                .expect("write failed");
+                new_g1s.push_back(GcodeInputG1Item {
+                    default_items_before: VecDeque::new(),
+                    g1: Some(G1LineContext {
+                        line,
+                        old_loc: prev_point,
+                        g: GcodeState {
+                            loc: point,
+                            is_abs_xyz: true,
+                            is_rel_e: true,
+                        },
+                        has_explicit_z: true,
+                        opt_extrude: Some(extrude),
+                        opt_f: None,
+                        opt_comment: Some(String::from("; splice")),
+                        is_spliced: true,
+                    }),
+                });
 
                 prev_point = point;
             }
@@ -2029,7 +2209,11 @@ fn generate_output(
                 let prev_point = new_g1s.back().unwrap().g1.as_ref().unwrap().g.loc;
                 let segment_norm = (coarse_after.g.loc - prev_point).norm();
                 let extrusion = coarse_extrusion_per_distance * segment_norm;
-                let new_coarse_after = G1LineContext{old_loc: prev_point, opt_extrude: Some(extrusion), ..coarse_after.clone()};
+                let new_coarse_after = G1LineContext {
+                    old_loc: prev_point,
+                    opt_extrude: Some(extrusion),
+                    ..coarse_after.clone()
+                };
                 *coarse_after = new_coarse_after;
             }
 
@@ -2037,7 +2221,9 @@ fn generate_output(
                 let mut rx_buffer = self.rx_buffer.borrow_mut();
                 new_g1s.append(&mut rx_buffer.first);
                 rx_buffer.first = new_g1s;
-                rx_buffer.first[0].default_items_before.append(&mut rescued_lines);
+                rx_buffer.first[0]
+                    .default_items_before
+                    .append(&mut rescued_lines);
             }
 
             true
@@ -2167,7 +2353,11 @@ fn generate_output(
                 }
             }
             let new_point = point_so_far;
-            ForcedPoint { point: new_point, p1_cursor: p1_cursor.unwrap(), p2_cursor: p2_cursor }
+            ForcedPoint {
+                point: new_point,
+                p1_cursor: p1_cursor.unwrap(),
+                p2_cursor: p2_cursor,
+            }
         }
     }
     impl GcodeLineHandler for DownstreamCoarseHandler {
@@ -2204,12 +2394,16 @@ fn generate_output(
             //println!("<<<< {}", c.line);
             let input_loc = c.g.loc;
             let forced_point = self.force_point(input_loc);
-            if !c.is_spliced && self.old_input_loc.is_some() && !Self::any_z_in_common(
-                forced_point.p1_cursor.layer.borrow().z,
-                forced_point.p2_cursor.as_ref().map(|c| c.layer.borrow().z),
-                self.old_p1_cursor.as_ref().map(|c| c.layer.borrow().z),
-                self.old_p2_cursor.as_ref().map(|c| c.layer.borrow().z),
-            ) && self.segment_gets_far_from_fine(self.old_input_loc.unwrap(), input_loc) {
+            if !c.is_spliced
+                && self.old_input_loc.is_some()
+                && !Self::any_z_in_common(
+                    forced_point.p1_cursor.layer.borrow().z,
+                    forced_point.p2_cursor.as_ref().map(|c| c.layer.borrow().z),
+                    self.old_p1_cursor.as_ref().map(|c| c.layer.borrow().z),
+                    self.old_p2_cursor.as_ref().map(|c| c.layer.borrow().z),
+                )
+                && self.segment_gets_far_from_fine(self.old_input_loc.unwrap(), input_loc)
+            {
                 if self.try_splicing(self.old_loc.z) {
                     // We spliced some of a fine perimeter into the pending input, in place of a
                     // problematic (horizontal step skip) portion of the coarse slicing. So we need
@@ -2280,24 +2474,34 @@ fn generate_output(
                 }
             }
             if let Some(mut iter_old_to_new_p1_cursor) = old_cursor {
-                let total_iter_distance = iter_old_to_new_p1_cursor.distance_to(&forced_point.p1_cursor);
+                let total_iter_distance =
+                    iter_old_to_new_p1_cursor.distance_to(&forced_point.p1_cursor);
                 let low_z = prev_point.z;
                 let high_z = forced_point.point.z;
                 if total_iter_distance > 0.0 {
                     loop {
                         iter_old_to_new_p1_cursor.advance_by_at_most(REMAINDER_OF_CURRENT_SEGMENT);
-                        let cmp_internal = iter_old_to_new_p1_cursor.cmp_internal(&forced_point.p1_cursor);
+                        let cmp_internal =
+                            iter_old_to_new_p1_cursor.cmp_internal(&forced_point.p1_cursor);
                         if cmp_internal.ordering != Ordering::Less {
                             break;
                         }
                         let iter_distance = total_iter_distance - cmp_internal.distance_to;
-                        let z_ramped = low_z + (high_z - low_z) * (iter_distance / total_iter_distance);
-                        let iter_forced_point = self.force_point(Point{z: z_ramped, ..iter_old_to_new_p1_cursor.get_point()});
+                        let z_ramped =
+                            low_z + (high_z - low_z) * (iter_distance / total_iter_distance);
+                        let iter_forced_point = self.force_point(Point {
+                            z: z_ramped,
+                            ..iter_old_to_new_p1_cursor.get_point()
+                        });
                         let mut iter_forced_cursor: Option<&LayerCursor> = None;
-                        if forced_point.p1_cursor.layer.borrow().z == iter_forced_point.p1_cursor.layer.borrow().z {
+                        if forced_point.p1_cursor.layer.borrow().z
+                            == iter_forced_point.p1_cursor.layer.borrow().z
+                        {
                             iter_forced_cursor = Some(&iter_forced_point.p1_cursor);
                         } else if let Some(iter_p2_cursor) = iter_forced_point.p2_cursor.as_ref() {
-                            if forced_point.p1_cursor.layer.borrow().z == iter_p2_cursor.layer.borrow().z {
+                            if forced_point.p1_cursor.layer.borrow().z
+                                == iter_p2_cursor.layer.borrow().z
+                            {
                                 iter_forced_cursor = Some(iter_p2_cursor);
                             }
                         }
@@ -2308,8 +2512,14 @@ fn generate_output(
                         if iter_forced_cursor.cmp(&forced_point.p1_cursor) != Ordering::Less {
                             break;
                         }
-                        let extrude = extrude_per_distance * (iter_forced_point.point - prev_point).norm();
-                        self.output_buffer.queue_g1(ExtrudingG1 { point: iter_forced_point.point, extrude, opt_f: None, opt_comment: Some(String::from("; iter")) });
+                        let extrude =
+                            extrude_per_distance * (iter_forced_point.point - prev_point).norm();
+                        self.output_buffer.queue_g1(ExtrudingG1 {
+                            point: iter_forced_point.point,
+                            extrude,
+                            opt_f: None,
+                            opt_comment: Some(String::from("; iter")),
+                        });
                         prev_point = iter_forced_point.point;
                     }
                 } else {
