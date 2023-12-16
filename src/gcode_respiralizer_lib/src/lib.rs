@@ -4,7 +4,7 @@ use ordered_float::OrderedFloat;
 use rand::Rng;
 use regex::Regex;
 use std::cell::{RefCell, RefMut};
-use std::cmp::min;
+use std::cmp::{min, Ordering};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::f32::consts::PI;
 use std::fmt::Write as fmt_Write;
@@ -571,6 +571,9 @@ pub struct Layer {
     // `points[points.len() - 1]` to `points[0]``.
     points: Vec<Point>,
 
+    // cumulative length of segments up to the point with the same index; [0] is always 0.0
+    cumulative_distance_up_to: Vec<Mm>,
+
     // We use KdTree instead of ImmutableKdTree for these reasons:
     //   * No need to build a big slice with more entries than G1(s) in the fine gcode, in addition
     //     to the tree itself.
@@ -581,6 +584,10 @@ pub struct Layer {
     // MAX_SUBSEGMENT_LENGTH, with index into points (above). The kd_tree has no filtering by layer
     // aside from just the z distances increasing as we get further away in z from a layer.
     kd_tree: KdTree,
+
+    // Total length of all segments in the layer, including the segment from points[points.len() -
+    // 1] to points[0]. This is used during comparison; comparison has to work across wrap.
+    total_length: Mm,
 }
 
 impl Layer {
@@ -837,6 +844,12 @@ pub struct LayerCursor {
     distance_along_segment: Mm,
 }
 
+#[derive(Debug)]
+pub struct CmpInternalResult {
+    ordering: Ordering,
+    distance_to: Mm,
+}
+
 impl LayerCursor {
     fn get_point(&self) -> Point {
         let layer = self.layer.borrow();
@@ -860,14 +873,56 @@ impl LayerCursor {
         let segment_end = layer.points[segment_end_index as usize];
         let segment_length = (segment_end - segment_start).norm();
         if self.distance_along_segment > segment_length {
-            self.segment_start_index += 1;
-            if self.segment_start_index as usize == layer.points.len() {
-                self.segment_start_index = 0;
-            }
+            self.segment_start_index = ((self.segment_start_index as usize + 1) % layer.points.len()).try_into().unwrap();
             // Since we don't ever want to skip an entire segment, we may as well start at 0.0
             // along the new segment.
             self.distance_along_segment = 0.0;
         }
+    }
+
+    // This compares two cursors in a way that doesn't have a discontinuity at the wrap. If two
+    // cursors are farther than layer.total_length / 2.0 from each other, the ordering is flipped
+    // since that means the cursors are really talking about the shorter part of the perimeter, by
+    // definition.
+    fn cmp_internal(&self, other: &LayerCursor) -> CmpInternalResult {
+        // This isn't unsafe since we're not doing anything unsafe with the pointer value(s).
+        assert!(self.layer.as_ptr() == other.layer.as_ptr());
+        let layer = self.layer.borrow();
+        let mut self_cumulative_distance = layer.cumulative_distance_up_to[self.segment_start_index as usize] + self.distance_along_segment;
+        let mut other_cumulative_distance = layer.cumulative_distance_up_to[other.segment_start_index as usize] + other.distance_along_segment;
+        let half_total_length = 0.5 * layer.total_length;
+        //dbg!(layer.total_length);
+        //dbg!(self_cumulative_distance);
+        //dbg!(other_cumulative_distance);
+        assert!(self_cumulative_distance < layer.total_length + 0.001);
+        assert!(other_cumulative_distance < layer.total_length + 0.001);
+        if self_cumulative_distance == other_cumulative_distance {
+            return CmpInternalResult{ ordering: Ordering::Equal, distance_to: 0.0 };
+        }
+        let mut self_minus_other = self_cumulative_distance - other_cumulative_distance;
+        if self_minus_other.abs() > half_total_length {
+            if self_cumulative_distance < other_cumulative_distance {
+                self_cumulative_distance += layer.total_length;
+            } else {
+                other_cumulative_distance += layer.total_length;
+            }
+            self_minus_other = self_cumulative_distance - other_cumulative_distance;
+        }
+        if self_minus_other > 0.0 {
+            return CmpInternalResult{ ordering: Ordering::Greater, distance_to: -self_minus_other };
+        } else {
+            return CmpInternalResult{ ordering: Ordering::Less, distance_to: -self_minus_other };
+        }
+    }
+
+    fn cmp(&self, other: &LayerCursor) -> Ordering {
+        let cmp_internal = self.cmp_internal(other);
+        cmp_internal.ordering
+    }
+
+    fn distance_to(&self, other: &LayerCursor) -> Mm {
+        let cmp_internal = self.cmp_internal(other);
+        cmp_internal.distance_to
     }
 }
 
@@ -1045,7 +1100,9 @@ pub fn read_fine_layers(gcode_lines: io::Lines<io::BufReader<std::fs::File>>) ->
                     weak_self: Weak::default(),
                     z: c.g.loc.z,
                     points: vec![],
+                    cumulative_distance_up_to: vec![],
                     kd_tree: KdTree::new(),
+                    total_length: 0.0,
                 }));
                 new_layer_rc.borrow_mut().weak_self = Rc::downgrade(&new_layer_rc);
                 let prev_layer = self
@@ -1060,8 +1117,14 @@ pub fn read_fine_layers(gcode_lines: io::Lines<io::BufReader<std::fs::File>>) ->
                     .unwrap()
                     .borrow_mut();
                 layer.points.push(c.old_loc.clone());
+                layer.cumulative_distance_up_to.push(0.0);
             }
             layer.points.push(c.g.loc.clone());
+
+            let distance_so_far = *layer.cumulative_distance_up_to.last().unwrap();
+            let distance_to_add = (layer.points[layer.points.len() - 1] - layer.points[layer.points.len() - 2]).norm();
+            layer.cumulative_distance_up_to.push(distance_so_far + distance_to_add);
+            layer.total_length += distance_to_add;
 
             // We ensure that each point on the segment is within MAX_SUBSEGMENT_LENGTH plus
             // KD_TREE_FUDGE_RADIUS of a point added to kd_tree.
@@ -1122,6 +1185,24 @@ pub fn read_fine_layers(gcode_lines: io::Lines<io::BufReader<std::fs::File>>) ->
 
     process_lines(gcode_lines, &mut line_handler);
 
+    for (_layer_z, layer_rc) in &line_handler.layers.layers {
+        let mut layer = layer_rc.borrow_mut();
+        // This will panic if a layer has only 1 point, which is fine since nothing after this will
+        // work properly with a 1 point layer anyway.
+        layer.total_length += (layer.points[0] - layer.points[layer.points.len() - 1]).norm();
+        assert!(layer.cumulative_distance_up_to.len() == layer.points.len());
+
+        //drop(layer);
+        //let layer = layer_rc.borrow();
+        //let mut layer_cursor = LayerCursor{distance_along_segment: 0.0, layer: layer.weak_self.upgrade().unwrap(), segment_start_index: 0};
+        //for _i in 0..100 {
+        //    let cloned_cursor = layer_cursor.clone();
+        //    layer_cursor.advance_by_at_most(GCODE_RESOLUTION);
+        //    let cmp_internal = cloned_cursor.cmp_internal(&layer_cursor);
+        //    dbg!(cmp_internal);
+        //}
+    }
+
     // yoink
     line_handler.layers
 }
@@ -1138,13 +1219,6 @@ fn clamp_point_to_segment(loc: Point, segment_start: Point, segment_end: Point) 
         segment_start + end_minus_start_unit * clamped_loc_perp_intersect_distance;
     clamped_loc_perp_intersect
 }
-
-//fn point_segment_distance(loc: Point, segment_start: Point, segment_end: Point) -> Mm {
-//    let clamped_loc_perp_intersect = clamp_point_to_segment(loc, segment_start, segment_end);
-//    let loc_minus_clamped_loc_perp_intersect = loc - clamped_loc_perp_intersect;
-//    let distance = loc_minus_clamped_loc_perp_intersect.norm();
-//    distance
-//}
 
 struct ExtrudingG1 {
     // XYZ
@@ -1610,6 +1684,11 @@ fn generate_output(
         fine_layers: Layers,
         rx_buffer: Rc<RefCell<RxBuffer>>,
     }
+    struct ForcedPoint {
+        point: Point,
+        p1_cursor: LayerCursor,
+        p2_cursor: Option<LayerCursor>,
+    }
     impl DownstreamCoarseHandler {
         fn any_z_in_common(
             p1_z: Mm,
@@ -1963,41 +2042,9 @@ fn generate_output(
 
             true
         }
-    }
-    impl GcodeLineHandler for DownstreamCoarseHandler {
-        fn handle_g1(&mut self, c: G1LineContext) {
-            if c.g.loc == c.old_loc && !c.opt_extrude.is_some() {
-                let mut new_line = String::new();
-                match c.opt_f {
-                    None => {
-                        write!(&mut new_line, "; same pos, no E, no F, removed: {}", c.line)
-                            .expect("write failed");
-                    }
-                    Some(f) => {
-                        write!(
-                            &mut new_line,
-                            "G1 F{} ; was same pos, no E, squelched: {}",
-                            f, c.line
-                        )
-                        .expect("write failed");
-                        if let Some(comment) = c.opt_comment {
-                            write!(new_line, " {}", comment).expect("write failed");
-                        }
-                    }
-                }
-                self.output_buffer.queue_line(&new_line);
-                return;
-            }
-            if !c.opt_extrude.is_some() || !c.has_explicit_z {
-                self.output_buffer.queue_line(c.line.as_str());
-                // We don't worry about this point being non-corrected. Technically "wrong" but
-                // doesn't matter enough to worry about.
-                self.old_loc = c.g.loc;
-                return;
-            }
-            //println!("<<<< {}", c.line);
-            let input_loc = c.g.loc;
-            let mut point_so_far: Point = input_loc;
+
+        fn force_point(&mut self, input_point: Point) -> ForcedPoint {
+            let mut point_so_far: Point = input_point;
             let mut refinement_step_ordinal = 0;
             let mut p1_cursor: Option<LayerCursor>;
             let mut p2_cursor: Option<LayerCursor>;
@@ -2052,7 +2099,7 @@ fn generate_output(
 
                 let old_point_so_far = point_so_far;
 
-                let loc_z = c.g.loc.z;
+                let loc_z = input_point.z;
                 if best_point_2.is_none() {
                     point_so_far = Point {
                         x: best_point_1.x,
@@ -2120,10 +2167,46 @@ fn generate_output(
                 }
             }
             let new_point = point_so_far;
-
+            ForcedPoint { point: new_point, p1_cursor: p1_cursor.unwrap(), p2_cursor: p2_cursor }
+        }
+    }
+    impl GcodeLineHandler for DownstreamCoarseHandler {
+        fn handle_g1(&mut self, c: G1LineContext) {
+            if c.g.loc == c.old_loc && !c.opt_extrude.is_some() {
+                let mut new_line = String::new();
+                match c.opt_f {
+                    None => {
+                        write!(&mut new_line, "; same pos, no E, no F, removed: {}", c.line)
+                            .expect("write failed");
+                    }
+                    Some(f) => {
+                        write!(
+                            &mut new_line,
+                            "G1 F{} ; was same pos, no E, squelched: {}",
+                            f, c.line
+                        )
+                        .expect("write failed");
+                        if let Some(comment) = c.opt_comment {
+                            write!(new_line, " {}", comment).expect("write failed");
+                        }
+                    }
+                }
+                self.output_buffer.queue_line(&new_line);
+                return;
+            }
+            if !c.opt_extrude.is_some() || !c.has_explicit_z {
+                self.output_buffer.queue_line(c.line.as_str());
+                // We don't worry about this point being non-corrected. Technically "wrong" but
+                // doesn't matter enough to worry about.
+                self.old_loc = c.g.loc;
+                return;
+            }
+            //println!("<<<< {}", c.line);
+            let input_loc = c.g.loc;
+            let forced_point = self.force_point(input_loc);
             if !c.is_spliced && self.old_input_loc.is_some() && !Self::any_z_in_common(
-                p1_cursor.as_ref().unwrap().layer.borrow().z,
-                p2_cursor.as_ref().map(|c| c.layer.borrow().z),
+                forced_point.p1_cursor.layer.borrow().z,
+                forced_point.p2_cursor.as_ref().map(|c| c.layer.borrow().z),
                 self.old_p1_cursor.as_ref().map(|c| c.layer.borrow().z),
                 self.old_p2_cursor.as_ref().map(|c| c.layer.borrow().z),
             ) && self.segment_gets_far_from_fine(self.old_input_loc.unwrap(), input_loc) {
@@ -2140,7 +2223,109 @@ fn generate_output(
 
             let old_move_distance = (c.g.loc - c.old_loc).norm();
             let old_extrude = c.opt_extrude.unwrap();
-            let new_move_distance = (new_point - self.old_loc).norm();
+            let extrude_per_distance = old_extrude / old_move_distance;
+            let mut prev_point = self.old_loc;
+
+            // Without this chunk of code, the first part of every coarse perimeter of the output
+            // post-respiralizing looks more rough. There are points that are out of place, vs the
+            // last part of every coarse perimeter which looks good. I believe the reason for this
+            // is the offset between the input coarse slicing and the input fine slicing is maximal
+            // at the start of each input coarse slicing perimeter (just after the fudged seam).
+            //
+            // The input coarse slicing points are essentially forced onto the input fine slicing
+            // perimeters in xy. But the roughness results when the optimal placement of points
+            // along the perimeter is different enough between the input fine slicing perimeter and
+            // the input coarse slicing, that the input coarse slicing's points aren't placed in
+            // important needed locations along the coarse perimeter. The force_point code doesn't
+            // invent points, and doesn't optimize on a segment-to-segment level, so really doesn't
+            // move points along the perimeter much; it mostly just moves points to the closest
+            // reasonable place on the fine perimeters (roughly speaking, for clarity of
+            // explanation). By bringing in the fine perimeter points (and only doing so at this
+            // stage, after splicing has done whatever it's going to do), we benefit from the fine
+            // slicing having a better fit of segments to the local shape of the perimeter, with
+            // substantially less offset between the points being forced and the perimeters (up to
+            // two) that we're forcing to.
+            //
+            // As mentioned below, we only use the closest fine perimeter for this, which maybe
+            // could be improved upon by using both the closest and second-closest ("p1" and "p2")
+            // when those have z on either side of the coarse z we're at. However, a concern with
+            // using the second-closest is what to do in situations where the coarse perimeter will
+            // be guiding us off away from second-closest - the concern is that by using both, we'd
+            // increase the chance of outputting a point that creates a sorta zig-zag-zig (the zag
+            // point being the one adversely impacted by using second-closest) when there should
+            // just be a zig. For now, just using the closest fine perimeter for this seems to work
+            // fine. Though of course the "closest" may be different for the previous point, so we
+            // use the closest for this point, and see if we can find the same perimeter in the
+            // prev point. If not, we bail on adding any of these in-between points from the
+            // closest fine perimeter since at that point "in-between" isn't really well defined
+            // enough, and probably we're better served by just letting the input coarse points
+            // guide the output points until the situation becomes clear again. Keeping in mind
+            // that we're already post-splicing at this point, so we shouldn't be getting any jumps
+            // on/off of (less than roughly 1/2-perimeter-sized) horizontal steps.
+            //
+            // For now we use up to one old cursor if there's a shared layer, but not a 2nd even if
+            // there are two shared layers. TODO: consider using both, though unclear how to order
+            // them, or how deal with potentially getting misdirected by a second-closest if it's
+            // diverging from closest. See longer paragraphs above.
+            let mut old_cursor: Option<LayerCursor> = None;
+            if let Some(old_p1_cursor) = self.old_p1_cursor.as_ref() {
+                if forced_point.p1_cursor.layer.borrow().z == old_p1_cursor.layer.borrow().z {
+                    old_cursor = Some(old_p1_cursor.clone());
+                }
+            }
+            if let Some(old_p2_cursor) = self.old_p2_cursor.as_ref() {
+                if forced_point.p1_cursor.layer.borrow().z == old_p2_cursor.layer.borrow().z {
+                    assert!(old_cursor.is_none());
+                    old_cursor = Some(old_p2_cursor.clone());
+                }
+            }
+            if let Some(mut iter_old_to_new_p1_cursor) = old_cursor {
+                let total_iter_distance = iter_old_to_new_p1_cursor.distance_to(&forced_point.p1_cursor);
+                let low_z = prev_point.z;
+                let high_z = forced_point.point.z;
+                if total_iter_distance > 0.0 {
+                    loop {
+                        iter_old_to_new_p1_cursor.advance_by_at_most(REMAINDER_OF_CURRENT_SEGMENT);
+                        let cmp_internal = iter_old_to_new_p1_cursor.cmp_internal(&forced_point.p1_cursor);
+                        if cmp_internal.ordering != Ordering::Less {
+                            break;
+                        }
+                        let iter_distance = total_iter_distance - cmp_internal.distance_to;
+                        let z_ramped = low_z + (high_z - low_z) * (iter_distance / total_iter_distance);
+                        let iter_forced_point = self.force_point(Point{z: z_ramped, ..iter_old_to_new_p1_cursor.get_point()});
+                        let mut iter_forced_cursor: Option<&LayerCursor> = None;
+                        if forced_point.p1_cursor.layer.borrow().z == iter_forced_point.p1_cursor.layer.borrow().z {
+                            iter_forced_cursor = Some(&iter_forced_point.p1_cursor);
+                        } else if let Some(iter_p2_cursor) = iter_forced_point.p2_cursor.as_ref() {
+                            if forced_point.p1_cursor.layer.borrow().z == iter_p2_cursor.layer.borrow().z {
+                                iter_forced_cursor = Some(iter_p2_cursor);
+                            }
+                        }
+                        if iter_forced_cursor.is_none() {
+                            break;
+                        }
+                        let iter_forced_cursor = iter_forced_cursor.unwrap();
+                        if iter_forced_cursor.cmp(&forced_point.p1_cursor) != Ordering::Less {
+                            break;
+                        }
+                        let extrude = extrude_per_distance * (iter_forced_point.point - prev_point).norm();
+                        self.output_buffer.queue_g1(ExtrudingG1 { point: iter_forced_point.point, extrude, opt_f: None, opt_comment: Some(String::from("; iter")) });
+                        prev_point = iter_forced_point.point;
+                    }
+                } else {
+                    // TODO: negative values might be small backwards movements, in which case we
+                    // could avoid that by tracking progress along a p1 cursor and p2 cursor to
+                    // only output points that are moving forward on post-force_point fine
+                    // perimeters. So far doesn't seem to be a huge issue, but some models might be
+                    // impacted more (by not doing this yet).
+
+                    //if total_iter_distance < 0.0 {
+                    //    dbg!(total_iter_distance);
+                    //}
+                }
+            }
+
+            let new_move_distance = (forced_point.point - prev_point).norm();
             let new_extrude = old_extrude * new_move_distance / old_move_distance;
 
             //dbg!(old_move_distance);
@@ -2149,15 +2334,15 @@ fn generate_output(
             //dbg!(new_extrude);
 
             self.output_buffer.queue_g1(ExtrudingG1 {
-                point: new_point,
+                point: forced_point.point,
                 extrude: new_extrude,
                 opt_f: c.opt_f,
                 opt_comment: c.opt_comment.map(|s| s.into()),
             });
 
-            self.old_loc = new_point;
-            self.old_p1_cursor = p1_cursor;
-            self.old_p2_cursor = p2_cursor;
+            self.old_loc = forced_point.point;
+            self.old_p1_cursor = Some(forced_point.p1_cursor);
+            self.old_p2_cursor = forced_point.p2_cursor;
             self.old_input_loc = Some(input_loc);
         }
 

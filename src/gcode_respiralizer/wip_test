@@ -1,4 +1,4 @@
 #!/bin/bash
 set -e
 clear
-cargo run --release -- /c/stuff/gr_test/fine_strainer_bottom_0.03mm_PETG_MK3S.gcode /c/stuff/gr_test/coarse_strainer_bottom_0.3mm_PETG_MK3S.gcode /c/stuff/gr_test/OUTPUT_fine_strainer_bottom.gcode
+cargo run -- /c/stuff/gr_test/fine_strainer_bottom_0.03mm_PETG_MK3S.gcode /c/stuff/gr_test/coarse_strainer_bottom_0.3mm_PETG_MK3S.gcode /c/stuff/gr_test/OUTPUT_fine_strainer_bottom.gcode
