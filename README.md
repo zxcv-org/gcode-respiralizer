@@ -6,6 +6,22 @@ The binary name is gcode_respiralizer (underscore).
 
 The lib name is gcode_respiralizer_lib (underscores).
 
+## WARNING
+
+CAUTION CAUTION CAUTION
+
+THIS CODE IS A PROTOTYPE AND THE GENERATED GCODE SHOULD BE SCRUTINIZED IN DETAIL
+BEFORE ANY ATTEMPT TO PRINT THE GCODE
+
+This code generates gcode, and this code may have bugs, resulting in bad gcode
+output, which can be hazardous to your printer, and possibly hazardous to print
+unattended in case of any bugs or unforeseen printing issues. While the author
+has printed a few models after processing with this code and didn't hit any
+significant issues, the author hasn't tested with your model, your printer, your
+workflow, etc.
+
+CAUTION CAUTION CAUTION
+
 ## Goal / Purpose
 
 Eliminate the vase mode "seam" that results when slicing in vase mode in
