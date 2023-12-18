@@ -981,7 +981,10 @@ pub struct G1LineContext {
     g: GcodeState,
     has_explicit_z: bool,
     opt_extrude: Option<Mm>,
+
+    // Stripped off separately before the G1 it's in fairly early on.
     opt_f: Option<Mm>,
+
     opt_comment: Option<String>,
     is_spliced: bool,
 }
@@ -1344,10 +1347,7 @@ impl ExtrudingG1Buffer {
         )
         .expect("write failed");
         //print!("G1 X{} Y{} Z{} E{}", g1.g1.point.x, g1.g1.point.y, g1.g1.point.z, g1.g1.extrude);
-        if let Some(f) = g1.g1.opt_f {
-            write!(buf_writer, " F{}", f).expect("write failed");
-            //print!(" F{}", f);
-        }
+        assert!(g1.g1.opt_f.is_none());
         if let Some(comment) = &g1.g1.opt_comment {
             write!(buf_writer, " {}", comment).expect("write failed");
             //print!(" {}", comment);
@@ -1607,32 +1607,26 @@ impl PeekCursor {
                                 input_g1.default_items_before.push_back(line);
                                 continue;
                             }
-                            GcodeInputHandlerItem::G1(c) => {
-                                if c.g.loc == c.old_loc && !c.opt_extrude.is_some() {
-                                    // TODO: avoid duplicated / super-similar code
+                            GcodeInputHandlerItem::G1(mut c) => {
+                                // TODO: avoid duplicated / super-similar code
+                                if c.opt_f.is_some() {
+                                    // separate out the G1 F, so we don't have to handle in-band F later
+                                    let input_g1 = rx_buffer.first.back_mut().unwrap();
                                     let mut new_line = String::new();
-                                    match c.opt_f {
-                                        None => {
-                                            write!(
-                                                &mut new_line,
-                                                "; same pos, no E, no F, removed (sp): {}",
-                                                c.line
-                                            )
-                                            .expect("write failed");
-                                        }
-                                        Some(f) => {
-                                            write!(
-                                                &mut new_line,
-                                                "G1 F{} ; was same pos, no E, squelched (sp): {}",
-                                                f, c.line
-                                            )
-                                            .expect("write failed");
-                                            if let Some(comment) = c.opt_comment {
-                                                write!(new_line, " {}", comment)
-                                                    .expect("write failed");
-                                            }
-                                        }
-                                    }
+                                    write!(&mut new_line, "G1 F{}", c.opt_f.unwrap())
+                                        .expect("write failed");
+                                    input_g1.default_items_before.push_back(new_line);
+                                    c.opt_f = None;
+                                }
+                                if c.g.loc == c.old_loc && !c.opt_extrude.is_some() {
+                                    let mut new_line = String::new();
+                                    assert!(c.opt_f.is_none());
+                                    write!(
+                                        &mut new_line,
+                                        "; same pos, no E, no F, removed (sp): {}",
+                                        c.line
+                                    )
+                                    .expect("write failed");
                                     let input_g1 = rx_buffer.first.back_mut().unwrap();
                                     input_g1.default_items_before.push_back(new_line);
                                     continue;
@@ -1756,12 +1750,19 @@ fn generate_output(
 ) {
     struct DownstreamCoarseHandler {
         output_buffer: ExtrudingG1Buffer,
+
         max_iterations_exceeded_count: u64,
         good_enough_before_max_iterations_count: u64,
+        avoided_backwards: u64,
+        dropped_too_clamped: u64,
+
         old_loc: Point,
         old_input_loc: Option<Point>,
+
+        // Updated whenever an output point is emitted (but prior to "peephole" step)
         prev_p1_cursor: Option<LayerCursor>,
         prev_p2_cursor: Option<LayerCursor>,
+
         fine_layers: Layers,
         rx_buffer: Rc<RefCell<RxBuffer>>,
     }
@@ -2229,11 +2230,27 @@ fn generate_output(
             true
         }
 
-        fn force_point(&mut self, input_point: Point) -> ForcedPoint {
+        fn find_prev_cursor_same_layer(&self, cursor: &LayerCursor) -> Option<LayerCursor> {
+            if let Some(prev_p1_cursor) = &self.prev_p1_cursor {
+                if prev_p1_cursor.layer.as_ptr() == cursor.layer.as_ptr() {
+                    return Some(prev_p1_cursor.clone());
+                }
+            }
+            if let Some(prev_p2_cursor) = &self.prev_p2_cursor {
+                if prev_p2_cursor.layer.as_ptr() == cursor.layer.as_ptr() {
+                    return Some(prev_p2_cursor.clone());
+                }
+            }
+            None
+        }
+
+        fn force_point(&mut self, input_point: Point) -> Option<ForcedPoint> {
             let mut point_so_far: Point = input_point;
             let mut refinement_step_ordinal = 0;
-            let mut p1_cursor: Option<LayerCursor>;
+            let mut p1_cursor: LayerCursor;
             let mut p2_cursor: Option<LayerCursor>;
+            let mut known_layers_count: u32;
+            let mut clamp_count: u32;
             loop {
                 let p1_distance_and_cursor = self.fine_layers.point_min_distance(
                     &point_so_far, FIRST_Z_MAX_DISTANCE_DEFAULT, None)
@@ -2275,13 +2292,45 @@ fn generate_output(
                     Some(exclude_z),
                 );
 
-                let best_point_1 = p1_distance_and_cursor.layer_cursor.get_point();
-                let best_point_2 = p2_distance_and_cursor
-                    .as_ref()
-                    .map(|distance_and_cursor| distance_and_cursor.layer_cursor.get_point());
-
-                p1_cursor = Some(p1_distance_and_cursor.layer_cursor);
+                p1_cursor = p1_distance_and_cursor.layer_cursor;
                 p2_cursor = p2_distance_and_cursor.map(|it| it.layer_cursor);
+
+                // Clamp to avoid moving backward along a fine perimeter, for any fine perimeters
+                // in common with prev_*_cursor(s). This doesn't prevent stopping, moving slightly
+                // up in z while extruding sligthly, and continuing. This also doesn't necessarily
+                // prevent moving backwards if only one fine layer is in common, or prevent at all
+                // if no fine layers are in common. But those cases get legitimately more difficult
+                // to define what "going backward" means, and whether "going backward is bad". The
+                // coarse path does need to have the freedom to backtrack when considering only the
+                // layers used by the previous coarse point, as long as the new coarse point
+                // doesn't use any layers in common with the previous coarse point
+                // (post-force_point).
+                //
+                // It's tempting to force moving forward by at least a minimal amount, but that has
+                // other potential issues, so let's go with this for now.
+                known_layers_count = 0;
+                clamp_count = 0;
+                if let Some(prev_p1_cursor) = self.find_prev_cursor_same_layer(&p1_cursor) {
+                    known_layers_count += 1;
+                    if prev_p1_cursor.cmp(&p1_cursor) == Ordering::Greater {
+                        p1_cursor = prev_p1_cursor.clone();
+                        self.avoided_backwards += 1;
+                        clamp_count += 1;
+                    }
+                }
+                if let Some(cur_p2_cursor) = &mut p2_cursor {
+                    if let Some(prev_p2_cursor) = self.find_prev_cursor_same_layer(&cur_p2_cursor) {
+                        known_layers_count += 1;
+                        if prev_p2_cursor.cmp(&cur_p2_cursor) == Ordering::Greater {
+                            *cur_p2_cursor = prev_p2_cursor.clone();
+                            self.avoided_backwards += 1;
+                            clamp_count += 1;
+                        }
+                    }
+                }
+
+                let best_point_1 = p1_cursor.get_point();
+                let best_point_2 = p2_cursor.as_ref().map(|cursor| cursor.get_point());
 
                 let old_point_so_far = point_so_far;
 
@@ -2352,35 +2401,34 @@ fn generate_output(
                     break;
                 }
             }
-            let new_point = point_so_far;
-            ForcedPoint {
-                point: new_point,
-                p1_cursor: p1_cursor.unwrap(),
-                p2_cursor: p2_cursor,
+            if known_layers_count != 0 && clamp_count == known_layers_count {
+                // This is effectively only moving in z (in an intent sense at least) so
+                // indicate this to the caller by refusing to generate a point
+                self.dropped_too_clamped += 1;
+                return None;
             }
+            let new_point = point_so_far;
+            Some(ForcedPoint {
+                point: new_point,
+                p1_cursor: p1_cursor,
+                p2_cursor: p2_cursor,
+            })
         }
     }
     impl GcodeLineHandler for DownstreamCoarseHandler {
-        fn handle_g1(&mut self, c: G1LineContext) {
+        fn handle_g1(&mut self, mut c: G1LineContext) {
+            if c.opt_f.is_some() {
+                // separate out the G1 F, so we don't have to handle in-band F later
+                let mut new_line = String::new();
+                write!(&mut new_line, "G1 F{}", c.opt_f.unwrap()).expect("write failed");
+                self.output_buffer.queue_line(&new_line);
+                c.opt_f = None;
+            }
             if c.g.loc == c.old_loc && !c.opt_extrude.is_some() {
                 let mut new_line = String::new();
-                match c.opt_f {
-                    None => {
-                        write!(&mut new_line, "; same pos, no E, no F, removed: {}", c.line)
-                            .expect("write failed");
-                    }
-                    Some(f) => {
-                        write!(
-                            &mut new_line,
-                            "G1 F{} ; was same pos, no E, squelched: {}",
-                            f, c.line
-                        )
-                        .expect("write failed");
-                        if let Some(comment) = c.opt_comment {
-                            write!(new_line, " {}", comment).expect("write failed");
-                        }
-                    }
-                }
+                assert!(c.opt_f.is_none());
+                write!(&mut new_line, "; same pos, no E, no F, removed: {}", c.line)
+                    .expect("write failed");
                 self.output_buffer.queue_line(&new_line);
                 return;
             }
@@ -2394,6 +2442,14 @@ fn generate_output(
             //println!("<<<< {}", c.line);
             let input_loc = c.g.loc;
             let forced_point = self.force_point(input_loc);
+            if forced_point.is_none() {
+                // the point ended up redundant due to being clamped to the previous point to avoid
+                // going backward, resulting in only moving in z - since that's not really a thing
+                // we want to print, we let the z ramp naturally over the next move that includes
+                // xy move as well
+                return;
+            }
+            let forced_point = forced_point.unwrap();
             if !c.is_spliced
                 && self.old_input_loc.is_some()
                 && !Self::any_z_in_common(
@@ -2493,6 +2549,11 @@ fn generate_output(
                             z: z_ramped,
                             ..iter_old_to_new_p1_cursor.get_point()
                         });
+                        if iter_forced_point.is_none() {
+                            // only a move in z, so omit
+                            continue;
+                        }
+                        let iter_forced_point = iter_forced_point.unwrap();
                         let mut iter_forced_cursor: Option<&LayerCursor> = None;
                         if forced_point.p1_cursor.layer.borrow().z
                             == iter_forced_point.p1_cursor.layer.borrow().z
@@ -2573,8 +2634,12 @@ fn generate_output(
 
     let mut coarse_handler = DownstreamCoarseHandler {
         output_buffer: ExtrudingG1Buffer::new(buf_writer),
+
         max_iterations_exceeded_count: 0,
         good_enough_before_max_iterations_count: 0,
+        avoided_backwards: 0,
+        dropped_too_clamped: 0,
+
         old_loc: Point::default(),
         old_input_loc: None,
         prev_p1_cursor: None,
@@ -2589,9 +2654,11 @@ fn generate_output(
     coarse_reader_thread.join().expect("join failed");
 
     println!(
-        "max_iterations_exceeded_count: {} good_enough_before_max_iterations_count: {}",
+        "max_iterations_exceeded_count: {} good_enough_before_max_iterations_count: {} avoided_backwards: {} dropped_too_clamped: {}",
         coarse_handler.max_iterations_exceeded_count,
-        coarse_handler.good_enough_before_max_iterations_count
+        coarse_handler.good_enough_before_max_iterations_count,
+        coarse_handler.avoided_backwards,
+        coarse_handler.dropped_too_clamped,
     );
 }
 
