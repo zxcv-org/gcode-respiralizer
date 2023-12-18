@@ -1759,9 +1759,9 @@ fn generate_output(
         max_iterations_exceeded_count: u64,
         good_enough_before_max_iterations_count: u64,
         old_loc: Point,
-        old_p1_cursor: Option<LayerCursor>,
-        old_p2_cursor: Option<LayerCursor>,
         old_input_loc: Option<Point>,
+        prev_p1_cursor: Option<LayerCursor>,
+        prev_p2_cursor: Option<LayerCursor>,
         fine_layers: Layers,
         rx_buffer: Rc<RefCell<RxBuffer>>,
     }
@@ -1852,7 +1852,7 @@ fn generate_output(
         }
 
         fn try_splicing(&mut self, start_search_z: Mm) -> bool {
-            let mut fine_cursor = self.old_p1_cursor.as_ref().unwrap().clone();
+            let mut fine_cursor = self.prev_p1_cursor.as_ref().unwrap().clone();
             let splice_layer_rc = fine_cursor.layer.clone();
             let splice_layer = splice_layer_rc.borrow();
 
@@ -2399,8 +2399,8 @@ fn generate_output(
                 && !Self::any_z_in_common(
                     forced_point.p1_cursor.layer.borrow().z,
                     forced_point.p2_cursor.as_ref().map(|c| c.layer.borrow().z),
-                    self.old_p1_cursor.as_ref().map(|c| c.layer.borrow().z),
-                    self.old_p2_cursor.as_ref().map(|c| c.layer.borrow().z),
+                    self.prev_p1_cursor.as_ref().map(|c| c.layer.borrow().z),
+                    self.prev_p2_cursor.as_ref().map(|c| c.layer.borrow().z),
                 )
                 && self.segment_gets_far_from_fine(self.old_input_loc.unwrap(), input_loc)
             {
@@ -2462,12 +2462,12 @@ fn generate_output(
             // them, or how deal with potentially getting misdirected by a second-closest if it's
             // diverging from closest. See longer paragraphs above.
             let mut old_cursor: Option<LayerCursor> = None;
-            if let Some(old_p1_cursor) = self.old_p1_cursor.as_ref() {
+            if let Some(old_p1_cursor) = self.prev_p1_cursor.as_ref() {
                 if forced_point.p1_cursor.layer.borrow().z == old_p1_cursor.layer.borrow().z {
                     old_cursor = Some(old_p1_cursor.clone());
                 }
             }
-            if let Some(old_p2_cursor) = self.old_p2_cursor.as_ref() {
+            if let Some(old_p2_cursor) = self.prev_p2_cursor.as_ref() {
                 if forced_point.p1_cursor.layer.borrow().z == old_p2_cursor.layer.borrow().z {
                     assert!(old_cursor.is_none());
                     old_cursor = Some(old_p2_cursor.clone());
@@ -2512,6 +2512,7 @@ fn generate_output(
                         if iter_forced_cursor.cmp(&forced_point.p1_cursor) != Ordering::Less {
                             break;
                         }
+
                         let extrude =
                             extrude_per_distance * (iter_forced_point.point - prev_point).norm();
                         self.output_buffer.queue_g1(ExtrudingG1 {
@@ -2521,6 +2522,8 @@ fn generate_output(
                             opt_comment: Some(String::from("; iter")),
                         });
                         prev_point = iter_forced_point.point;
+                        self.prev_p1_cursor = Some(iter_forced_point.p1_cursor);
+                        self.prev_p2_cursor = iter_forced_point.p2_cursor;
                     }
                 } else {
                     // TODO: negative values might be small backwards movements, in which case we
@@ -2549,10 +2552,10 @@ fn generate_output(
                 opt_f: c.opt_f,
                 opt_comment: c.opt_comment.map(|s| s.into()),
             });
+            self.prev_p1_cursor = Some(forced_point.p1_cursor);
+            self.prev_p2_cursor = forced_point.p2_cursor;
 
             self.old_loc = forced_point.point;
-            self.old_p1_cursor = Some(forced_point.p1_cursor);
-            self.old_p2_cursor = forced_point.p2_cursor;
             self.old_input_loc = Some(input_loc);
         }
 
@@ -2573,9 +2576,9 @@ fn generate_output(
         max_iterations_exceeded_count: 0,
         good_enough_before_max_iterations_count: 0,
         old_loc: Point::default(),
-        old_p1_cursor: None,
-        old_p2_cursor: None,
         old_input_loc: None,
+        prev_p1_cursor: None,
+        prev_p2_cursor: None,
         fine_layers,
         rx_buffer: rx_buffer.clone(),
     };
