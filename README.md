@@ -35,12 +35,23 @@ governance docs cover to cover.
 
 ## How-To
 
+### Building
+
+1. Download the code - if unsure how, use the green "Code" button up top and
+   "download zip", then extract the zip somewhere convenient.
+1. Install rustlang: [https://www.rust-lang.org/tools/install]
+1. Open a command prompt and go to the src/gcode_spiralizer directory.
+1. Run "cargo build --release". This will compile the code from source, into a
+   gcode_spiralizer executable (see under target/release sub dir for the
+   executable).
+1. See below under "Prusaslicer" for how to use the executable.
+
 ### Prusaslicer
 
 1. Turn off detect bridging perimeters (to slice faster and avoid bridging flow
    ratio in any part of the spiral). In my experience, with an extrusion width
    that isn't too much larger than the nozzle diameter, and prioritizing quality
-   over speed, vase mode prints can bridge fine without these slicing features.
+   over speed, vase mode prints can bridge just fine without this.
 1. Switch from arachne to classic. Leave it classic for the rest of this (vase
    mode uses classic without indicating so in the UI; we need the non-vase
    slicing below to use classic also).
@@ -52,36 +63,39 @@ governance docs cover to cover.
 1. Set retract/detract/extra detract to all off / 0.0mm.
 1. Set layer height and first layer height to 0.02mm (~1/10th of the layer
    height you actually want)
+1. Set to zero bottom layers (temporarily).
 1. Position the model exactly where you want it on the build plate. From the
    next step onward, do not move the model on the plate.
-1. Slice, and save the gcode file for use below.
+1. Slice, and save the gcode file as "fine.gcode" (or similar) for use below.
    * (TODO: gcode-respiralizer will auto-detect that this is the finely-sliced
      file, and will save a copy for gcode-respiralizer to use later)
 1. Set layer height to 0.3mm or 0.2mm (whichever you want the output gcode to
-   be). Currently 0.3mm is recommended if you don't care which, but 0.2 should
-   work. Layer heights > 0.3 aren't recommended yet.
+   be). Other layer heights may not work at all.
    * (TODO: auto-detect and auto-tune thresholds based on detected layer
      height.)
 1. Check vase mode again.
-1. Slice, and save the gcode file for use below.
+1. Add back any bottom layers per taste.
+1. Slice, and save the gcode file as "coarse.gcode" (or similar) for use below.
    * (TODO: gcode-respiralizer will auto-detect that this is the coarse-sliced
      file, and based on filename, will pair it up with the previously-saved
      finely-sliced file)
 1. Run "gcode_spiralizer fine.gcode coarse.gcode OUTPUT.gcode". Wait a bit, or a
    while, or a longer while, depending. Look at your favorite task manager /
-   system monitor / perfmon "disk" or "fs" tab or similar to see if it's still
-   working and not just stuck in an infinite loop.
+   system monitor / perfmon.exe "disk" or "fs" tab or similar to see if it's still
+   working and not just stuck.
    * TODO: more incremental status to command line during fine perimeter loading
      and output generation.
-1. Open output in gcode analyzer, visually verify that it looks plausible -
+1. Open OUTPUT.gcode in gcode analyzer, visually verify that it looks plausible;
    sweep through the layers; check again - it is up to you to verify that you
    want to print this weirdly-generated gcode. In particular, there is no reason
    to believe that the generated gcode will absolutely never go backwards,
-   extruding over what it's already printed. Thankfully due to the nature of the
-   generated gcode, the z ramping would (probably) still be happening, so
-   hopefully the extruder wouldn't skip, but BEWARE.
-1. Print, and hopefully verify that the vase mode fudge "seam" is not present,
-   and that there aren't any artifacts introduced by this gcode post-processor.
+   extruding over what it's already printed (should be rare, but can happen).
+   Thankfully due to the nature of the generated gcode, the z ramping would
+   (probably) still be happening, so hopefully the extruder wouldn't skip, but
+   BEWARE.
+1. Print (if you accept all risks), and hopefully verify that the vase mode
+   fudge "seam" is not present, and that there aren't any artifacts introduced
+   by this gcode post-processor.
 
 ## Theory of Operation (currently somewhat stale)
 
